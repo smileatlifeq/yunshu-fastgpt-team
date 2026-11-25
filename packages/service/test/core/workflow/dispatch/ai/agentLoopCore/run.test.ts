@@ -1,0 +1,691 @@
+import { ChatCompletionRequestMessageRoleEnum } from '@fastgpt/global/core/ai/constants';
+import { runAgentLoopApplication } from '@fastgpt/service/core/ai/llm/agentLoop/application/run';
+import {
+  runAgentLoopCore,
+  runAgentLoopCoreWithSummary
+} from '@fastgpt/service/core/workflow/dispatch/ai/agentLoopCore/application/run';
+import { describe, expect, it, vi } from 'vitest';
+
+const { runAgentLoopMock } = vi.hoisted(() => ({
+  runAgentLoopMock: vi.fn()
+}));
+
+vi.mock('@fastgpt/service/core/ai/llm/agentLoop/interface', async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import('@fastgpt/service/core/ai/llm/agentLoop/interface')>();
+
+  return {
+    ...original,
+    runAgentLoop: runAgentLoopMock
+  };
+});
+
+describe('runAgentLoopCore', () => {
+  it('uses events as the only assistantResponses source', async () => {
+    runAgentLoopMock.mockResolvedValue({
+      status: 'done',
+      completeMessages: [],
+      assistantMessages: [
+        {
+          role: ChatCompletionRequestMessageRoleEnum.Assistant,
+          content: 'answer'
+        }
+      ],
+      requestIds: ['req_1'],
+      finishReason: 'stop',
+      usages: []
+    });
+
+    const result = await runAgentLoopCore({
+      input: {
+        messages: []
+      },
+      runtime: {
+        llmParams: {
+          model: 'gpt-4'
+        },
+        toolCatalog: {
+          runtimeTools: []
+        },
+        executeTool: vi.fn()
+      } as any,
+      assistantResponses: {
+        extraResponses: [
+          {
+            id: 'extra',
+            text: {
+              content: 'extra'
+            }
+          }
+        ]
+      }
+    });
+
+    expect(result.assistantMessages).toHaveLength(1);
+    expect(result.assistantResponses).toEqual([
+      {
+        id: 'extra',
+        text: {
+          content: 'extra'
+        }
+      }
+    ]);
+  });
+
+  it('runs agent-loop and builds assistantResponses from standard events without transcript duplication', async () => {
+    runAgentLoopMock.mockImplementation(async ({ runtime }) => {
+      const call = {
+        id: 'call_1',
+        type: 'function',
+        function: {
+          name: 'search',
+          arguments: '{"q":"hello"}'
+        }
+      };
+      runtime.emitEvent({ type: 'tool_call', call });
+      runtime.emitEvent({
+        type: 'llm_request_end',
+        requestIndex: 1,
+        modelName: 'gpt-4',
+        requestId: 'req_1',
+        finishReason: 'tool_calls',
+        answerText: 'answer',
+        toolCalls: [call],
+        seconds: 0.1
+      });
+      runtime.emitEvent({
+        type: 'tool_run_end',
+        call,
+        response: 'tool result',
+        seconds: 0.1
+      });
+
+      return {
+        status: 'done',
+        completeMessages: [],
+        assistantMessages: [
+          {
+            role: ChatCompletionRequestMessageRoleEnum.Assistant,
+            content: 'answer',
+            tool_calls: [call]
+          },
+          {
+            role: ChatCompletionRequestMessageRoleEnum.Tool,
+            tool_call_id: 'call_1',
+            content: 'tool result'
+          }
+        ],
+        requestIds: ['req_1'],
+        finishReason: 'stop',
+        usages: []
+      };
+    });
+
+    const runtime = {
+      llmParams: {
+        model: 'gpt-4'
+      },
+      toolCatalog: {
+        runtimeTools: []
+      },
+      executeTool: vi.fn()
+    } as any;
+    const result = await runAgentLoopCore({
+      provider: 'fastAgent',
+      input: {
+        messages: []
+      },
+      runtime,
+      assistantResponses: {
+        getEventToolInfo: () => ({
+          name: 'Search',
+          avatar: 'search-avatar'
+        }),
+        extraResponses: [
+          {
+            id: 'extra',
+            text: {
+              content: 'extra'
+            }
+          }
+        ]
+      }
+    });
+
+    expect(runAgentLoopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'fastAgent',
+        input: {
+          messages: []
+        },
+        runtime: expect.objectContaining({
+          llmParams: runtime.llmParams,
+          toolCatalog: runtime.toolCatalog,
+          executeTool: runtime.executeTool
+        })
+      })
+    );
+    expect(result.completeMessages).toEqual([]);
+    expect(result.assistantResponses).toEqual([
+      expect.objectContaining({
+        id: 'extra',
+        text: {
+          content: 'extra'
+        }
+      }),
+      expect.objectContaining({
+        text: {
+          content: 'answer'
+        },
+        tools: [
+          expect.objectContaining({
+            id: 'call_1',
+            toolName: 'Search',
+            toolAvatar: 'search-avatar',
+            response: 'tool result'
+          })
+        ]
+      })
+    ]);
+  });
+
+  it('collects event assistantResponses before forwarding runtime events', async () => {
+    const eventTarget: any[] = [];
+    const forwardedEvents: any[] = [];
+
+    runAgentLoopMock.mockImplementation(async ({ runtime }) => {
+      runtime.emitEvent({
+        type: 'answer_delta',
+        text: 'hello'
+      });
+      runtime.emitEvent({
+        type: 'tool_call',
+        call: {
+          id: 'call_search',
+          type: 'function',
+          function: {
+            name: 'search',
+            arguments: '{"q":"FastGPT"}'
+          }
+        }
+      });
+      runtime.emitEvent({
+        type: 'tool_run_end',
+        call: {
+          id: 'call_search',
+          type: 'function',
+          function: {
+            name: 'search',
+            arguments: '{"q":"FastGPT"}'
+          }
+        },
+        response: 'tool result',
+        seconds: 0.1
+      });
+      runtime.emitEvent({
+        type: 'plan_operation',
+        operation: 'set_plan',
+        success: true,
+        message: 'plan created',
+        id: 'call_plan',
+        params: '{"name":"Implementation plan","steps":["Implement plan events"]}',
+        plan: {
+          planId: 'plan_1',
+          name: 'Implementation plan',
+          description: null,
+          steps: [
+            {
+              id: 'step_1',
+              name: 'Implement plan events',
+              status: 'pending'
+            }
+          ]
+        }
+      });
+
+      return {
+        status: 'done',
+        completeMessages: [],
+        assistantMessages: [],
+        requestIds: ['req_1'],
+        finishReason: 'stop',
+        usages: []
+      };
+    });
+
+    const result = await runAgentLoopCore({
+      input: {
+        messages: []
+      },
+      runtime: {
+        llmParams: {
+          model: 'gpt-4'
+        },
+        toolCatalog: {
+          runtimeTools: []
+        },
+        executeTool: vi.fn(),
+        emitEvent: (event) => {
+          forwardedEvents.push(event);
+        }
+      } as any,
+      assistantResponses: {
+        eventTarget,
+        getEventToolInfo: () => ({
+          name: 'Search',
+          avatar: 'search-avatar'
+        }),
+        metaEventNames: {
+          setPlanToolName: 'agent_set_plan',
+          updatePlanToolName: 'agent_update_plan'
+        }
+      }
+    });
+
+    expect(eventTarget).toMatchObject([
+      {
+        text: { content: 'hello' },
+        tools: [
+          { id: 'call_search', response: 'tool result' },
+          {
+            id: 'call_plan',
+            functionName: 'agent_set_plan',
+            response: 'plan created',
+            hideInUI: true
+          }
+        ],
+        plan: { planId: 'plan_1', steps: [{ status: 'pending' }] }
+      }
+    ]);
+    expect(forwardedEvents).toEqual([
+      expect.objectContaining({
+        type: 'answer_delta'
+      }),
+      expect.objectContaining({
+        type: 'tool_call'
+      }),
+      expect.objectContaining({
+        type: 'tool_run_end'
+      }),
+      expect.objectContaining({
+        type: 'plan_operation',
+        id: 'call_plan'
+      })
+    ]);
+    expect(result.assistantResponses).toEqual(eventTarget);
+  });
+
+  it('uses configured file read directories for outward events and persisted responses', async () => {
+    const forwardedEvents: any[] = [];
+    const privateCall = {
+      id: 'call_private',
+      type: 'function' as const,
+      function: {
+        name: 'sandbox_read_file',
+        arguments: '{"path":"/root/.fastgpt/runtime/state.json"}'
+      }
+    };
+    const publicCall = {
+      id: 'call_public',
+      type: 'function' as const,
+      function: {
+        name: 'sandbox_read_file',
+        arguments: '{"path":"/workspace/research.txt"}'
+      }
+    };
+
+    runAgentLoopMock.mockImplementation(async ({ runtime, input }) =>
+      runAgentLoopApplication({
+        runtime,
+        input,
+        provider: {
+          name: 'fastAgent',
+          run: async ({ runtime }) => {
+            runtime.emitEvent?.({
+              type: 'llm_request_end',
+              requestIndex: 1,
+              modelName: 'gpt-4',
+              requestId: 'req_1',
+              finishReason: 'tool_calls',
+              toolCalls: [privateCall, publicCall],
+              seconds: 0.1
+            });
+            for (const call of [privateCall, publicCall]) {
+              runtime.emitEvent?.({
+                type: 'tool_call',
+                call: {
+                  ...call,
+                  function: { ...call.function, arguments: '' }
+                }
+              });
+              runtime.emitEvent?.({
+                type: 'tool_params',
+                callId: call.id,
+                argsDelta: call.function.arguments
+              });
+              runtime.emitEvent?.({ type: 'tool_run_start', call });
+              runtime.emitEvent?.({
+                type: 'tool_run_end',
+                call,
+                response: call === privateCall ? 'internal access denied' : 'public result',
+                errorMessage: call === privateCall ? 'INTERNAL_ACCESS_DENIED' : undefined,
+                seconds: 0.1
+              });
+            }
+
+            return {
+              status: 'done',
+              completeMessages: [
+                {
+                  role: ChatCompletionRequestMessageRoleEnum.Assistant,
+                  content: null,
+                  tool_calls: [privateCall, publicCall]
+                },
+                {
+                  role: ChatCompletionRequestMessageRoleEnum.Tool,
+                  tool_call_id: privateCall.id,
+                  content: 'internal access denied'
+                },
+                {
+                  role: ChatCompletionRequestMessageRoleEnum.Tool,
+                  tool_call_id: publicCall.id,
+                  content: 'public result'
+                }
+              ],
+              assistantMessages: [
+                {
+                  role: ChatCompletionRequestMessageRoleEnum.Tool,
+                  tool_call_id: privateCall.id,
+                  content: 'internal access denied'
+                }
+              ],
+              requestIds: ['req_1'],
+              finishReason: 'stop',
+              usages: []
+            };
+          }
+        }
+      })
+    );
+
+    const result = await runAgentLoopCore({
+      input: { messages: [] },
+      runtime: {
+        teamId: 'team',
+        llmParams: { model: 'gpt-4' },
+        toolCatalog: { runtimeTools: [] },
+        executeTool: vi.fn(),
+        systemTools: {
+          sandbox: {
+            enabled: true,
+            client: { resolveRuntimePath: (path: string) => path },
+            internalReadDirectories: ['/root/.fastgpt']
+          }
+        },
+        emitEvent: (event) => forwardedEvents.push(event)
+      } as any,
+      assistantResponses: {
+        getEventToolInfo: () => ({ name: 'Sandbox read file' })
+      }
+    });
+
+    expect(forwardedEvents).toHaveLength(7);
+    expect(forwardedEvents[0]).toEqual(
+      expect.objectContaining({
+        type: 'llm_request_end',
+        toolCalls: [publicCall]
+      })
+    );
+    expect(forwardedEvents.slice(1, 3)).toEqual([
+      {
+        type: 'tool_activity',
+        callId: privateCall.id,
+        toolName: privateCall.function.name,
+        status: 'running'
+      },
+      {
+        type: 'tool_activity',
+        callId: privateCall.id,
+        toolName: privateCall.function.name,
+        status: 'done'
+      }
+    ]);
+    const forwardedToolEvents = forwardedEvents.slice(3);
+    expect(
+      forwardedToolEvents.every((event) =>
+        event.type === 'tool_params'
+          ? event.callId === publicCall.id
+          : event.call?.id === publicCall.id
+      )
+    ).toBe(true);
+    expect(result.assistantResponses).toMatchObject([
+      {
+        tools: [
+          {
+            id: privateCall.id,
+            params: privateCall.function.arguments,
+            response: 'internal access denied',
+            internalOnly: true
+          },
+          { id: publicCall.id, response: 'public result' }
+        ]
+      }
+    ]);
+  });
+
+  it('maps low-level paused result to workflow core interactive status', async () => {
+    const ask = {
+      reason: 'Need confirmation',
+      blockerType: 'missing_required_input' as const,
+      questions: [
+        {
+          question: 'Confirm?',
+          options: [
+            { summary: 'Yes', value: 'Yes' },
+            { summary: 'No', value: 'No' },
+            { summary: 'Not sure', value: 'Not sure' }
+          ]
+        }
+      ]
+    };
+    runAgentLoopMock.mockResolvedValue({
+      status: 'paused',
+      pause: {
+        toolCallId: 'call_ask',
+        interactive: {
+          type: 'agentAsk',
+          params: { toolCallId: 'call_ask', arguments: JSON.stringify(ask) }
+        }
+      },
+      completeMessages: [],
+      assistantMessages: [],
+      requestIds: ['req_ask'],
+      finishReason: 'stop',
+      usages: []
+    });
+
+    const result = await runAgentLoopCore({
+      input: {
+        messages: []
+      },
+      runtime: {
+        llmParams: {
+          model: 'gpt-4'
+        },
+        toolCatalog: {
+          runtimeTools: []
+        },
+        executeTool: vi.fn()
+      } as any
+    });
+
+    expect(result.status).toBe('interactive');
+    expect(result.pause).toEqual({
+      toolCallId: 'call_ask',
+      interactive: {
+        type: 'agentAsk',
+        params: { toolCallId: 'call_ask', arguments: JSON.stringify(ask) }
+      }
+    });
+  });
+
+  it('returns the core result and normalized summary together', async () => {
+    runAgentLoopMock.mockResolvedValue({
+      status: 'done',
+      completeMessages: [],
+      assistantMessages: [
+        {
+          role: ChatCompletionRequestMessageRoleEnum.Assistant,
+          content: 'answer'
+        }
+      ],
+      requestIds: ['req_summary'],
+      finishReason: 'stop',
+      usages: [
+        {
+          moduleName: 'account_usage:agent_call',
+          inputTokens: 3,
+          outputTokens: 2,
+          totalPoints: 0.5
+        }
+      ]
+    });
+
+    const { result, summary } = await runAgentLoopCoreWithSummary({
+      input: {
+        messages: []
+      },
+      runtime: {
+        llmParams: {
+          model: 'gpt-4'
+        },
+        toolCatalog: {
+          runtimeTools: []
+        },
+        executeTool: vi.fn()
+      } as any
+    });
+
+    expect(result.status).toBe('done');
+    expect(summary).toEqual(
+      expect.objectContaining({
+        status: 'done',
+        requestIds: ['req_summary'],
+        inputTokens: 3,
+        outputTokens: 2,
+        llmTotalPoints: 0.5,
+        finalText: 'answer'
+      })
+    );
+  });
+});
+
+describe('Agent Loop summary ownership', () => {
+  it('does not expose an independent event token summary', async () => {
+    runAgentLoopMock.mockImplementationOnce(async ({ runtime }) => {
+      runtime.emitEvent({
+        type: 'tool_run_end',
+        call: { id: 'tool', function: { name: 'child', arguments: '{}' } },
+        response: '',
+        seconds: 1,
+        usages: [],
+        toolResponseCompress: {
+          response: '',
+          modelName: 'model',
+          requestIds: [],
+          seconds: 1,
+          usage: { moduleName: 'compress', inputTokens: 3, outputTokens: 1, totalPoints: 1 }
+        }
+      });
+      return {
+        status: 'done',
+        completeMessages: [],
+        assistantMessages: [],
+        requestIds: [],
+        finishReason: 'stop',
+        usages: []
+      };
+    });
+
+    const { summary } = await runAgentLoopCoreWithSummary({
+      input: { messages: [] },
+      runtime: {} as any
+    });
+
+    expect(summary).not.toHaveProperty('nodeSummary');
+  });
+
+  it.each(['done', 'error', 'paused'])(
+    '统计 %s 本轮主调用与压缩，排除同名子 Agent 账单',
+    async (status) => {
+      const childUsage = {
+        moduleName: 'account_usage:agent_call',
+        inputTokens: 999,
+        outputTokens: 888,
+        totalPoints: 10
+      };
+      runAgentLoopMock.mockImplementationOnce(async ({ runtime }) => {
+        for (const inputTokens of [10, 20])
+          runtime.emitEvent({
+            type: 'llm_request_end',
+            requestIndex: 1,
+            requestId: 'req',
+            modelName: 'model',
+            finishReason: 'stop',
+            seconds: 1,
+            usages: [{ moduleName: 'arbitrary name', inputTokens, outputTokens: 2, totalPoints: 1 }]
+          });
+        runtime.emitEvent({
+          type: 'after_message_compress',
+          modelName: 'model',
+          requestIds: [],
+          seconds: 1,
+          usages: [{ moduleName: 'compress', inputTokens: 5, outputTokens: 1, totalPoints: 1 }]
+        });
+        runtime.emitEvent({
+          type: 'tool_run_end',
+          call: { id: 'tool', function: { name: 'child', arguments: '{}' } },
+          response: '',
+          seconds: 1,
+          usages: [childUsage],
+          toolResponseCompress: {
+            response: '',
+            modelName: 'model',
+            requestIds: [],
+            seconds: 1,
+            usage: { moduleName: 'compress', inputTokens: 3, outputTokens: 1, totalPoints: 1 }
+          }
+        });
+        return {
+          status,
+          completeMessages: [],
+          assistantMessages: [],
+          requestIds: [],
+          finishReason: 'stop',
+          usages: [childUsage],
+          ...(status === 'error' ? { error: 'failed' } : {}),
+          ...(status === 'paused'
+            ? {
+                pause: {
+                  toolCallId: 'ask',
+                  interactive: {
+                    type: 'agentAsk',
+                    params: {
+                      toolCallId: 'ask',
+                      arguments: JSON.stringify({ reason: 'continue?', questions: [] })
+                    }
+                  }
+                }
+              }
+            : {})
+        };
+      });
+      const { summary } = await runAgentLoopCoreWithSummary({
+        input: { messages: [] },
+        runtime: {} as any
+      });
+      expect(summary).not.toHaveProperty('nodeSummary');
+      expect(summary.usages).toEqual([childUsage]);
+    }
+  );
+});

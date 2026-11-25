@@ -1,0 +1,410 @@
+# Workflow 输入文件上下文统一设计
+
+## 1. 背景
+
+Workflow 输入文件目前以 URL 字符串贯穿 AI Chat、ToolCall、Agent、ReadFiles 和
+Sandbox。URL 同时承担模型访问地址、服务端下载地址、文件类型推断和去重标识，导致同源
+绝对 URL、相对下载短链和外部 URL 容易被错误转换。
+
+尤其需要避免以下行为：
+
+- 根据 `requestOrigin`、`FE_DOMAIN` 或 URL 前缀推断文件权限；
+- 将用户输入的相对 URL 交给内部 Axios；
+- 让动态 URL 绕过 HTTP(S)、SSRF 和文件大小限制；
+- 使用模型 URL 作为私有对象的服务端读取来源。
+
+本期引入请求级的 `WorkflowFileContext`。根 query 在聊天持久化和 `dispatchWorkFlow`
+之前统一裁剪；dispatch 使用运行态副本处理 query、histories 和全局文件变量，并允许交互恢复入口及 Plugin Input 登记 `fileSelect` 文件。下游消费者
+可以通过受限的外链登记接口复用探测结果；私有文件登记仍只允许受控输入适配器执行。
+
+## 2. 本期范围
+
+### 2.1 包含
+
+- 当前 query 中的文件；
+- histories 中 Human 消息携带的文件；
+- Workflow 全局文件变量、交互表单和 Plugin Input 的 `fileSelect` 文件；
+- AI Chat、ToolCall、Agent、ReadFiles 和 Sandbox 对上述文件的消费；
+- 私有 chat object key 的归属校验；
+- 外部绝对 HTTP(S) URL 的 SSRF 防护读取；
+- 请求级文件数量和单文件大小限制。
+
+### 2.2 不包含
+
+- Workflow 运行期间由普通节点、Plugin 或 Dataset Search 新产生的文件登记；
+- Workflow 文件变量的存储结构迁移；
+- 跨请求持久化 `WorkflowFileRef`；
+- 修改聊天数据库中的现有文件格式；
+- 通过 signed alias 反推业务归属；
+- Context clone、分支注册和合并。
+
+## 3. 核心原则
+
+### 3.1 key 是私有文件的可信来源
+
+私有文件必须携带 `key`。Workflow 入口使用 `parseChatFileS3Key` 或
+`isAuthorizedChatFileS3Key` 校验 key 是否属于根 Workflow：
+
+```text
+key
+  -> sourceType
+  -> sourceId
+  -> uid
+  -> chatId
+  -> 与根 Workflow 鉴权上下文逐项匹配
+```
+
+匹配使用根 `dispatchWorkFlow` 的 `runningAppInfo`、`uid` 和 `chatId`。Child Workflow 不得
+使用 child app 的身份重新解释父 Workflow 输入文件。
+
+归属匹配失败时直接拒绝。不能把失败的私有 key 降级成外部 URL。
+
+### 3.2 signed URL 只用于模型访问
+
+signed URL 不参与权限判断。私有 key 校验通过后，每个 key 在一次 Workflow 中最多签发
+一次两小时有效的绝对 HTTP(S) URL，并在请求内复用。
+
+如果文件域名配置无法生成绝对 HTTP(S) URL，入口应报配置错误，不能生成相对 URL。
+
+### 3.3 服务端读取与模型 URL 分离
+
+- 私有 chat object：FastGPT 服务端通过 S3 client 直接读取；
+- 外部 HTTP(S) URL：FastGPT 服务端通过带 SSRF 防护的 Axios 读取；
+- 模型只接收 `modelUrl`；
+- 相对 URL、protocol-relative URL 和非 HTTP(S) 协议一律不能进入读取链路。
+
+### 3.4 登记边界
+
+Workflow 输入适配器通过独立 `WorkflowFileRegistrar` 登记 query/history/全局变量、交互恢复入口
+和 Plugin Input 文件，私有对象必须校验根 scope。节点消费者通过 `prepareWorkflowFiles` 准备文件，
+底层统一由 `prepareChatFiles` 编排：身份去重与数量截断 → 输入校验 → 分类 → 登记。
+`registerExternalFile` 只同步写入已分类外链，不探测、不创建私有 key 权限。
+同一 Context 内并发和后续调用复用远端类型和文件名结果（包括失败降级），探测并发上限为 5，
+缓存随 Context 回收；调用方的显示名称和显式类型提示不进入探测缓存。Child 动态外链不回写 Parent；在 Parent 进程提前准备的文件可以登记在 Parent，Child 只继承选中的输入。
+
+`core/chat/file/service.ts` 的 `parseUrlToChatFileType` 是唯一链接分类实现，优先使用
+已登记元数据，其次为明确媒体类型、可信对象元数据、文件后缀、系统链接探测和普通文件降级。
+分类不筛选数量、不校验业务准入、不登记文件；网络请求层保留逐跳安全检查。
+底层只接收窄 Context 接口，工作流包装层注入当前 Context，避免 chat 反向依赖 workflow。
+AI、文档读取、知识库和签名短链共用分类规则，消费者不得再次覆盖已登记类型。
+`core/chat/file/utils.ts` 提供纯身份计算和列表选择；外链身份忽略 fragment，保留签名参数。
+根 query 的消息条数上限和 Child 的跨输入额度仍由各自适配器决定。根 Human 历史按私有 key、已登记身份或外链身份去重后，对每条消息独立裁剪；保留首个文件元数据和非文件项的原始顺序。文档读取先过滤空链接，再按身份去重和截断，空链接不占用额度。
+相对 URL 直接拒绝。模型 `read_files` 的公网读取策略保持独立，不借外链登记接口扩大私有权限。
+
+系统级 `common/file/infer/service.ts` 的 `inferFileTypeFromUrl` 不依赖聊天和工作流，
+接收 HTTP(S) URL、可选超时/取消信号和逐跳 URL 策略，返回 `{ url, filename, extension, contentType }`。
+URL 保留原始签名参数；文件名来自 Content-Disposition、filename 查询参数或 URL 路径，
+去除目录和控制字符；后缀带点、小写，按已识别 MIME/签名修正，未知时允许为空。
+直接调用始终先 HEAD；明确 MIME 可直接返回。通用或缺失 MIME，以及 HEAD 的
+403/405/501、连接超时/重置会回退流式 GET（Range 0–8191）；签名不足时回退文件名。
+客户端最多保留 8 KiB，忽略 Range 的 200 响应也主动断流；不自动解压。
+默认共享 3 秒请求预算，HEAD 超时为一半预算。网络、安全及读取错误抛给业务层处理；
+聊天层将失败降级为 file。SSRF 和业务传入的 URL 策略同样约束 GET 及其重定向。
+该方法仅推测元数据，不校验文件完整性，不登记 Context，不承担列表过滤或下载业务。
+聊天分类入口遇到非空 filename 查询参数或带后缀的 URL 路径文件名时不发起远端探测；已知媒体后缀按媒体分类，其它后缀保留为普通文件。目录中的后缀和显式显示名称不代表链接自身有文件名，不能阻止无文件名链接探测。
+聊天层消费 contentType 和 filename；filename 已包含探测的 extension，随分类结果保存到 Context Ref 并在链接读取时传给文件源。显式 name 保留为显示名称，未提供时使用链接文件名或原始 URL。解析优先使用带非空后缀的显示名称，否则使用探测文件名；两者均无非空后缀时允许下载响应的 Content-Disposition 补充。
+AI Chat 按已识别的 fileType 转换音频，不再向运行态 file_url 注入来源文件名，也不按显示名称或文件名过滤音频。URL 有已知音频后缀时保留 input_audio.format；无已知格式时省略 format，由模型接口处理音频内容。关闭音频输入时仍过滤音频附件。
+音频附件是否进入模型由 AI 节点的 `aiChatAudio` 与模型的 `config.audio` 共同决定；工作流的 `fileSelectConfig.canSelectAudio` 只控制上传入口，不影响全局文件变量或节点文件链接的音频输入。
+客户端 FileSelector 对无文件名外链直接发起 HEAD，通过已有 MIME 库推断后缀或复用 Content-Disposition 文件名，再统一交给 getFileIcon 计算展示图标；filename 查询参数或带后缀的路径文件名不探测。请求使用 fetch，通过 AbortController 联动调用方取消和 3 秒超时；try/catch 静默处理请求与响应解析失败，finally 清理定时器和监听，取消后的迟到响应也被忽略；图标更新 Promise 链继续静默兜底。浏览器 CORS 限制、未知元数据和非成功响应均保留原图标，不阻塞输入；删除、更换链接和卸载时取消请求。探测结果不回写 name/type 或持久化值，后端文件分类与读取规则保持独立。
+
+## 4. 数据模型
+
+```ts
+export type WorkflowFileSource =
+  | {
+      type: 'chatObject';
+      objectKey: string;
+    }
+  | {
+      type: 'externalHttp';
+      url: string;
+    };
+
+export type WorkflowFileRef = {
+  name: string;
+  type: ChatFileTypeEnum;
+  modelUrl: string;
+  source: WorkflowFileSource;
+};
+
+export type WorkflowFileLimits = {
+  maxFileAmount: number;
+  maxBytesPerFile: number;
+};
+
+export type WorkflowFileContext = {
+  resolve: (url: string) => WorkflowFileRef | undefined;
+  resolveInputFile: (file: RawChatFileValue) => WorkflowFileRef | undefined;
+  resolveChatFile: (url: string) => UserChatItemFileItemType | undefined;
+  getIdentity: (url: string) => string | undefined;
+  getSource: (target: string | WorkflowFileRef) => Promise<WorkflowFileSourceResult>;
+  registerExternalFile: (file: UserChatItemFileItemType) => WorkflowFileRef;
+  derive: (files: WorkflowFileInput[]) => Promise<WorkflowFileContext>;
+  limits: WorkflowFileLimits;
+};
+```
+
+Context 不暴露通用私有文件登记、`clone` 或文件枚举接口。内部至少维护：
+
+- `byRuntimeUrl`：本轮 `modelUrl` 到 Ref；
+- `byIdentity`：私有 key 或外部 URL（忽略 fragment）到 Ref，用于去重；
+- 根和 Child 通过同一登记表封装维护索引、别名、Ref 去重和聊天文件转换，每次创建独立登记表；私有授权与继承规则由各自流程负责。
+- 分类模块以 Context 为 WeakMap 键保存探测 Promise 和并发队列，合并同一身份的远端探测，并在本次请求内复用降级结果；登记表只保存完成分类的 Ref。
+
+模型和节点之间只传递 URL。Context 不生成或解析 file id；`resolveInputFile` 仅供受控输入
+适配器根据原始文件对象中的 key 或 URL 查找已登记 Ref。
+
+私有文件登记能力通过独立的 `WorkflowFileRegistrar` 只传给受控输入适配器；下游
+`WorkflowFileContext` 仅开放经过校验的外链登记。
+
+## 5. Workflow 入口
+
+入口处理顺序：
+
+```text
+完成 Workflow/Chat 鉴权
+  -> 计算根 Workflow 文件 scope
+  -> 根据团队套餐和系统配置计算 Context maxFileAmount/maxBytesPerFile
+  -> 根据应用 chatConfig 计算 queryMaxFileAmount
+  -> 在 preChatRound 前按 queryMaxFileAmount 保留根 query 中前 N 个文件项
+  -> 持久化和 dispatch 复用同一份过滤后 query
+  -> 文件 Context 和历史预览转换返回新的 query/histories，不回写调用方数据
+  -> 扫描 query + histories + 全局文件变量
+  -> 校验 chat object key 归属
+  -> 校验外链必须为绝对 HTTP(S)
+  -> 对私有 key 按请求缓存签发两小时 modelUrl
+  -> 对候选文件先截断、推断类型并同步返回的运行态消息
+  -> 按 key/外链 URL 去重并建立 Context
+  -> 将 FileContext 挂载到 WorkflowContext
+  -> 开始节点调度
+```
+
+### 5.1 Query
+
+- `chatConfig.fileSelectConfig.maxFiles` 只表示根 query 的上传文件数量上限；未配置时回退到
+  用户可用的文件数量上限。超额文件项在入口静默丢弃，非文件输入和剩余输入的原始顺序保持
+  不变；
+- Chat Completions 中的图片 Data URL 不受模型 Base64 配置影响，入口始终先按用户数量和
+  单文件大小额度完成校验并上传到私有 S3，再以携带 `key` 的临时 URL 进入 Workflow。模型
+  是否重新读取该文件并转换为 Base64，仍由模型配置决定；
+- 带 key：完整校验 `sourceType/sourceId/uid/chatId`，失败则拒绝本轮 Workflow；
+- 无 key：只允许绝对 HTTP(S) URL，并继续应用 `fileUrlWhitelist`；
+- 其他 URL：拒绝本轮 Workflow。
+
+### 5.2 Histories
+
+- 带 key：使用根 Workflow scope 校验并签发 URL；
+- 无 key的绝对 HTTP(S) URL：登记为外链；
+- 无 key的相对或非法 URL：不登记，使用该文件时返回不可用，不能交给内部 Axios；
+- 无关历史文件不可用时，不能阻塞整轮 Workflow。
+
+入口只登记来源和签发 URL，不下载所有历史文件正文。正文继续按消费者需求懒加载。
+
+### 5.3 全局变量、交互和 Plugin fileSelect
+
+- 全局文件变量只在 `WorkflowVariableState.create` 初始化时登记，后续节点 `set()` 不得扩展 Context；
+- 文件变量由节点 `set()` 更新时只接受绝对 HTTP(S) URL；已存在于当前或父变量状态映射中的
+  runtime URL 复用原始 store metadata，保留私有 key，未知 URL 才按外链存储；
+- 全局文件变量、交互 Form Input 和 Plugin Input 都属于具有独立模块配额的文件输入：显式
+  配置 `maxFiles` 时使用该值，历史配置未提供时模块额度默认为 5，最终有效额度统一为
+  `min(模块额度, WorkflowFileContext.limits.maxFileAmount)`；
+- 文件变量的有效额度在 `WorkflowVariableState.create` 登记变量时归一化，后续更新只读取
+  确定的 `config.maxFiles`；
+- 交互恢复入口只登记当前表单配置为 `fileSelect` 且位于有效额度内的值；
+- Plugin Input 只登记节点配置为 `fileSelect` 且位于有效额度内的字段值，同时兼容文件对象
+  数组和 URL 字符串数组；
+- 带 key 的值必须按根 Workflow scope 校验，并按私有对象处理；
+- 无 key 的绝对 HTTP(S) URL 登记为外链；其他值拒绝。
+
+## 6. 读取规则
+
+### 6.1 私有对象
+
+`WorkflowFileContext.read` 根据 Ref 中已校验的 bucket/objectKey 使用 S3 client：
+
+1. 先读取 metadata；
+2. `contentLength` 超过 `maxBytesPerFile` 时拒绝；
+3. 下载流再次按累计字节数限制；
+4. 返回 Buffer、filename 和 contentType。
+
+### 6.2 外部 URL
+
+外部 URL 始终使用带 SSRF 防护的 Axios：
+
+- 只允许 `http:` 和 `https:`；
+- 普通上传文件入口保留 `fileUrlWhitelist`；`read_files` 的动态模型 URL 不受上传文件域名白名单限制；
+- SSRF Axios 负责 DNS、metadata 地址和逐跳重定向检查；
+- 先检查 `Content-Length`，流式下载时再次限制累计字节数；
+- 禁止使用 `pickOutboundAxios` 或任何内部相对路径 Axios。
+
+Raw-text 缓存只能在文件引用完成授权后查询：已登记文件使用 Context identity；未登记动态
+外链必须先通过绝对 HTTP(S) 和内部地址检查。普通文件入口还需通过域名白名单，`read_files`
+允许读取运行中生成的任意公网 URL，二者都不能通过缓存命中绕过各自的出站策略。
+
+### 6.3 大小限制
+
+`WorkflowFileContext.limits.maxFileAmount` 表示当前用户可用的文件数量上限，优先取团队套餐的
+`planStatus.standard.maxUploadFileCount`，未配置套餐额度时回退到系统
+`global.feConfigs.uploadFileMaxAmount`。应用 Query 未配置 `maxFiles` 时直接使用该用户额度；
+Form、Plugin 和全局文件变量则使用各自的模块额度，并与该用户额度取较小值。
+
+AI Chat、ToolCall、Agent、ReadFiles 和模型 `read_files` 等没有独立字段配置的消费者必须直接
+读取当前 `WorkflowFileContext.limits.maxFileAmount`，不得回退到应用 query 上传配置或硬编码数量。
+
+`dispatchWorkFlow` 接受可选的 `maxBytesPerFile`（字节）。调用入口可以根据团队套餐和系统限制
+计算后传入；未传入时使用系统 `getFileMaxSize()`。已登记外链和未登记动态外链复用同一个
+SSRF-safe reader，并使用同一请求级 `maxBytesPerFile`。
+
+该限制约束 FastGPT 服务端读取。模型提供商直接拉取外部 `modelUrl` 时，不经过 FastGPT
+下载链路，因此不计入服务端读取限制。
+
+## 7. 消费者
+
+### 7.1 AI Chat
+
+- 已登记文档由 Context 统一读取；未登记绝对 HTTP(S) URL 由 SSRF Axios 读取；
+- 图片、音频、视频默认使用 `modelUrl`；
+- LLM 层不感知 Workflow Context；`shouldLoadMediaAsBase64` 为真时统一使用 AI 层已有的
+  下载与 Base64 转换能力，否则把绝对 `modelUrl` 直接交给模型。
+
+### 7.2 ToolCall 和 Agent read_files
+
+- 模型通过 `read_files({ urls: string[] })` 直接提交 model URL，不再生成、暴露或映射 file id；
+- URL 命中 Context 时直读已授权私有对象；
+- 未命中的绝对 HTTP(S) URL 作为运行中生成的动态外链读取，不要求预先枚举，也不写入 Context；
+- 动态外链不受上传文件域名白名单限制，但必须通过 HTTP(S)、SSRF、重定向和文件大小检查；
+- 相对 URL 和非 HTTP(S) URL 返回文件不可用；
+- ToolCall 和 Agent 共用同一个批量读取执行器，并返回相同的 JSON 与 `nodeResponse`；
+- 文档解析继续复用 `core/chat/fileContext.ts`。
+
+### 7.3 ReadFiles
+
+ReadFiles 的字符串 URL 输入保持兼容：命中 Context 时走 Context reader，未命中的绝对
+HTTP(S) URL 走 SSRF Axios，相对 URL 不可读取。
+
+### 7.4 Sandbox
+
+Workflow 显式向 Agent 和 ToolCall Sandbox 文件注入步骤传入组合读取函数：命中
+WorkflowFileContext 时读取 Buffer，未命中的绝对 URL 交给带 SSRF 防护的 Sandbox reader。
+Sandbox 通用模块不引用 Workflow，也不使用 `requestOrigin`、相对 URL 或内部 Axios。
+
+Sandbox 通过 `sandbox_get_file_url` 导出的文件属于临时产物：对象按两小时 TTL 管理，返回的
+访问链接有效期同样为两小时。导出文件不写入聊天消息的 `fileRefs`，也不随聊天记录持久化或
+自动续期；超过有效期后文件及链接不可继续使用属于预期行为。
+
+### 7.5 Child、Loop 和 Parallel
+
+Loop 和 Parallel 共享当前 Context。Child 在父 Context 下先过滤实际传入的 query、history、
+全局文件变量和 `fileSelect` 输入，再根据保留文件派生最小 Context。选择优先级依次为当前 query、
+显式变量/节点输入、从新到旧的 history；输出仍保持原消息顺序。实际传入的文件对象或普通字符串 URL 命中父 Context 时，
+继承可信 Ref 和原 `modelUrl`，不重新签名；父 Context 未命中的合法绝对 HTTP(S) URL 在 Child
+内登记为外链。普通字符串只能通过完整 URL 精确命中父 Context，不得根据签名 URL 结构反解
+私有 key。Child 也不能通过派生 Context 枚举未实际传入的父文件；携带未知私有 key 的文件对象
+不得通过冲突 URL 降级命中父 Ref。
+
+被额度裁掉的文件必须同时从 Child 的实际 payload 删除，不能只从派生 Context 中移除后继续作为
+普通绝对 URL 消费。Child 交互新增文件仍通过父 registrar 完成根 scope 鉴权，登记过程串行执行，
+成功后同步加入当前派生 Context。
+
+父子运行边界同时隔离输入引用：Child 收到的 query、history、消息 value 和对象型文件输入均由
+遍历构造的新对象组成，不直接复用 Parent payload 的可变对象。Loop 和 Parallel 属于同一 Workflow
+的容器运行，继续共享只读 query/history，并单独隔离会被执行过程修改的节点、边和变量状态。
+
+## 8. 兼容策略
+
+- 文件类型、名称和 key 等运行态元数据统一由 WorkflowFileContext 提供，不再维护额外的
+  query URL Map；
+- WorkflowFileContext 复用 Workflow 自己的 AsyncLocalStorage，并由 Workflow 调用方显式传给
+  Chat/Sandbox；`core/ai` 和 `core/chat` 不得反向引用 `core/workflow`；
+- 字符串 URL 运行值继续保留；
+- keyless 历史绝对 URL 按外链处理；
+- Context 未命中的绝对 HTTP(S) URL 在通过文件域名白名单后推断类型并登记，后续节点和文档读取
+  复用该 Ref；并发的同一外链共享探测 Promise，探测失败的普通文件兜底结果也在本次运行内复用；
+- 登记 query/history 时同步推断类型并返回新的消息文件对象。私有文件按可信 key 和显式类型推断，
+  外链优先采用显式多模态类型和链接文件名，仅对无文件名链接调用系统探测；HEAD、GET 及重定向均检查域名策略；
+- 文件列表在探测前去重、截断；同名沙箱文件在并发分类完成后按输入顺序命名；
+- Child 派生先完成父级 Ref 继承和新外链准入校验，再批量准备新外链（最多 5 并发），并将类型同步到其 query/history；Child 新外链只进入自身登记表；
+- keyless 历史相对 URL 不再通过内部 Axios 读取；
+- Agent 的 `normalizeAgentServerFileUrl` 和 `internalUrl` 过渡实现已删除；
+- Workflow 以外的普通聊天文件链路暂不纳入本期 Context，但共享读取函数不能再接受相对 URL。
+
+## 9. 测试要求
+
+### 9.1 Context
+
+- query/history 私有 key 归属校验成功；
+- sourceType/sourceId/uid/chatId 任一不匹配时拒绝；
+- 同一个 key 在 query/history 中只签发一次并只创建一个 Ref；
+- 外部绝对 HTTP(S) URL 可登记；
+- 相对 URL、protocol-relative、`file:`、`data:`、`ws:` 被拒绝或跳过；
+- 普通文件入口的 `fileUrlWhitelist` 继续生效，`read_files` 动态模型 URL 明确豁免；
+- `resolve` 和单文件分类不会自动登记未知绝对 URL；
+- 分类和登记分离后，相同链接在 AI 输入、文档读取、知识库查询中类型一致；
+- 探测期间出现明确类型登记时，较早发起的探测不能覆盖已登记结果；
+- 不同准备批次共享 Context 的探测并发上限，超限文件不校验、不探测、不登记；
+- 文档批量读取按文件报告校验失败，其他文件继续读取。
+- 全局文件变量只在初始化时登记，节点更新不会扩展 Context；
+- 节点更新文件变量时只接受绝对 HTTP(S) URL，已知内部文件 URL 保留私有 key，未知 URL 按外链存储；
+- 交互 `fileSelect` 的私有 key 和外链均可登记；
+- Plugin Input `fileSelect` 的文件对象和 URL 字符串均可登记或复用当前 Context；
+
+### 9.2 读取
+
+- 私有对象通过 S3 client 读取；
+- 外链通过 SSRF Axios 读取；
+- 私有对象和外链均执行 header/metadata 与流式双重大小限制；
+- 私有对象读取不调用 HTTP；
+- 相对 URL 不进入任何 Axios。
+- `read_files` 可读取 Context 未登记的公网绝对 URL，但仍拒绝内网地址并执行大小限制；
+
+### 9.3 消费者
+
+- AI Chat、ToolCall、Agent、ReadFiles 优先使用同一 Context，并支持安全外链回退；
+- Agent history 和当前输入都保留绝对 modelUrl；
+- ToolCall 和 Agent 的 `read_files` 只接收 URL，不存在 file id 或已知文件枚举映射；
+- ToolCall 和 Agent 的读取结果统一为 JSON，文件节点展示字段保持一致；
+- read_files 的动态公网 URL 可读，相对 URL、非 HTTP(S) URL 和内网地址不可读；
+- Agent 和 ToolCall Sandbox 注入使用 Context/SSRF 外链组合 reader；
+- Child 只在派生 Context 中继承实际传入且通过文件 key 或完整 URL 命中的父 Ref，同一私有文件不重复签名；
+- 作为普通字符串显式传入 Child 的 URL 命中父 Context 时继承父 Ref，未命中时按外链登记；
+- Child 新绝对 URL 登记为外链，未知私有 key 不得继承；
+- Child query/history 和派生 Context 使用同一筛选结果，超额绝对 URL 不会残留在实际 payload；
+- Child query/history/value/file 对象不与 Parent 共享可变引用；
+- Child 并发交互登记不会突破 Context 文件数量上限；
+- 不可用的无关 history 文件不阻塞本轮请求。
+
+## 10. TODO
+
+- [x] 新增 `WorkflowFileContext` 和入口准备函数，外链登记支持请求内分类复用；
+- [x] 为 `dispatchWorkFlow` 增加 `maxBytesPerFile`，创建并挂载 Context；
+- [x] `parseUrlToChatFileType` 统一类型规则，`prepareWorkflowFiles` 组合筛选、校验与登记；
+- [x] 统一 `core/chat/fileContext.ts` 的 Workflow 文件读取；
+- [x] 保持 AI Chat 多模态 Base64 与 Workflow Context 解耦；
+- [x] 迁移 ToolCall、Agent 和 ReadFiles；
+- [x] 迁移 Sandbox 文件注入；
+- [x] 登记全局文件变量、交互和 Plugin Input 的 `fileSelect` 输入；
+- [x] 为 Context 未命中的绝对 URL 增加 SSRF 外链回退；
+- [x] 为 Child Workflow 派生最小文件 Context，并复用父级可信 Ref；
+- [x] 在持久化前统一裁剪根 query，并保证 dispatch 不修改调用方数据；
+- [x] Child 先过滤实际 payload，再派生 Context，并串行化运行中登记；
+- [x] Child 输入在父子边界重新映射，避免可变 payload 引用透传；
+- [x] Workflow 内无独立配置的文件消费者统一使用 Context limit；
+- [x] 删除 Agent `requestOrigin/internalUrl` 过渡逻辑；
+- [x] 补齐 Context、读取器和消费者测试；
+- [x] 执行全量测试；相关用例通过，App `copy.test.ts` 在并发运行时超时，单独复跑通过。
+
+相关入口辅助实现位于 `packages/service/core/workflow/utils/fileLimits.ts`。
+
+## 11. 相关代码
+
+- `packages/service/core/workflow/utils/context.ts`
+- `packages/service/core/workflow/utils/fileContext.ts`
+- `packages/service/core/workflow/dispatch/index.ts`
+- `packages/service/core/chat/fileContext.ts`
+- `packages/service/core/workflow/dispatch/ai/chat/chatMessages.ts`
+- `packages/service/core/workflow/dispatch/ai/readFiles.ts`
+- `packages/service/core/workflow/dispatch/ai/agent/adapter/userContext.ts`
+- `packages/service/core/ai/sandbox/application/file.ts`
+- `packages/service/core/workflow/dispatch/tools/readFiles.ts`
+- `packages/service/common/api/axios.ts`
+- `packages/service/common/s3/sources/chat/key.ts`

@@ -1,0 +1,792 @@
+import type { AgentLoopPause } from '../../../domain/result';
+import type { AgentAskInteractive } from '@fastgpt/global/core/ai/agent/type';
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+  ChatCompletionTool,
+  CompletionFinishReason
+} from '@fastgpt/global/core/ai/llm/type';
+import { ChatCompletionRequestMessageRoleEnum } from '@fastgpt/global/core/ai/constants';
+import type { CreateLLMResponseProps } from '../../../../request';
+import { createLLMResponse } from '../../../../request';
+import { compressRequestMessages, compressToolResponse } from '../../../../compress';
+import { filterEmptyAssistantMessages } from './message';
+import { countGptMessagesTokens } from '../../../../../../../common/string/tiktoken';
+import { formatModelChars2Points } from '../../../../../../../support/wallet/usage/utils';
+import type { LLMModelDataType } from '@fastgpt/global/core/ai/model/schema';
+import type { AgentLoopAssistantResponse } from '../../../domain/tool';
+import type {
+  AgentLoopChildrenInteractiveParams,
+  AgentLoopCompletionPolicy,
+  AgentLoopInteractiveToolExecuteParams,
+  AgentLoopToolExecutionResult,
+  AgentLoopUsage
+} from './type';
+import { getErrText } from '@fastgpt/global/common/error/utils';
+import { batchRun } from '@fastgpt/global/common/system/utils';
+import { normalizeToolResponseContent } from '@fastgpt/global/core/ai/llm/utils';
+import type { AgentPlanType } from '@fastgpt/global/core/ai/agent/type';
+import { getNanoid } from '@fastgpt/global/common/string/tools';
+import {
+  createFileClassificationContext,
+  type FileClassificationContext
+} from '../../../../../../../common/file/classification';
+
+type RunAgentCallProps<TChildrenResponse = unknown> = {
+  maxRunAgentTimes: number;
+  completionPolicy?: AgentLoopCompletionPolicy;
+  batchToolSize?: number;
+  fileContext?: FileClassificationContext;
+  body: CreateLLMResponseProps['body'] & {
+    tools: ChatCompletionTool[];
+    temperature?: number;
+    top_p?: number;
+    stream?: boolean;
+  };
+
+  isAborted: CreateLLMResponseProps['isAborted'];
+  userKey?: CreateLLMResponseProps['userKey'];
+  teamId: string;
+
+  childrenInteractiveParams?: AgentLoopChildrenInteractiveParams<TChildrenResponse>;
+  /** 每轮压缩时读取最新 plan，避免传入 loop 启动时的过期快照。 */
+  getActivePlan?: () => AgentPlanType | undefined;
+  // LLM 压缩后回调
+  onAfterCompressContext?: (e: {
+    usage?: AgentLoopUsage;
+    requestIds: string[];
+    seconds: number;
+    contextCheckpoint?: string;
+  }) => void;
+  // 处理交互工具
+  onRunInteractiveTool: (
+    e: AgentLoopInteractiveToolExecuteParams<TChildrenResponse>
+  ) => Promise<AgentLoopToolExecutionResult<TChildrenResponse>>;
+  // 处理工具响应
+  onRunTool: (e: {
+    call: ChatCompletionMessageToolCall;
+    messages: ChatCompletionMessageParam[];
+    assistantMessage?: ChatCompletionMessageParam;
+  }) => Promise<AgentLoopToolExecutionResult<TChildrenResponse | AgentAskInteractive>>;
+  // 返回 false 的工具会按 toolCalls 顺序串行执行，用于 plan/ask_user 这类有状态内部工具。
+  canBatchTool?: (call: ChatCompletionMessageToolCall) => boolean;
+  // 每次 createLLMResponse 的生命周期回调。
+  // workflow adapter 用它向客户端展示模型运行状态，并增量收集 requestId。
+  onLLMRequestStart?: (e: { requestIndex: number; modelName: string; responseId: string }) => void;
+  onLLMRequestEnd?: (e: {
+    responseId: string;
+    assistantMessage?: ChatCompletionMessageParam;
+    requestIndex: number;
+    modelName: string;
+    requestId: string;
+    finishReason?: CompletionFinishReason;
+    answerText?: string;
+    reasoningText?: string;
+    toolCalls?: ChatCompletionMessageToolCall[];
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      totalPoints: number;
+    };
+    firstTokenTime?: number;
+    seconds: number;
+    error?: unknown;
+  }) => void;
+  onToolRunEnd?: (e: {
+    resumed?: boolean;
+    hideInUI?: boolean;
+    call: ChatCompletionMessageToolCall;
+    response: string;
+    assistantMessages?: ChatCompletionMessageParam[];
+    assistantResponses?: AgentLoopAssistantResponse[];
+    errorMessage?: string;
+    seconds: number;
+    usages?: AgentLoopUsage[];
+    metadata?: unknown;
+    interactive?: TChildrenResponse | AgentAskInteractive;
+    toolResponseCompress?: {
+      response: string;
+      modelName: string;
+      usage: AgentLoopUsage;
+      requestIds: string[];
+      seconds: number;
+    };
+  }) => void;
+  onUserMessage?: (e: { content: string; source: 'server' }) => void;
+  onToolCall?: (e: { call: ChatCompletionMessageToolCall }) => void;
+  onToolParam?: (e: { call: ChatCompletionMessageToolCall; argsDelta: string }) => void;
+  onToolRunStart?: (e: { call: ChatCompletionMessageToolCall }) => void;
+  onStreaming?: (e: { text: string }) => void;
+  onReasoning?: (e: { text: string }) => void;
+};
+
+type RunAgentResponse<TChildrenResponse = unknown> = {
+  requestIds: string[];
+  error?: any;
+  completeMessages: ChatCompletionMessageParam[]; // Loop request complete messages
+  assistantMessages: ChatCompletionMessageParam[]; // Loop assistant response messages
+  pause?: AgentLoopPause<TChildrenResponse>;
+
+  // Usage
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  llmTotalPoints: number; // 每次 LLM 调用单独计价后的累计价格（用于梯度计费）
+  contextCheckpoint?: string;
+
+  finish_reason: CompletionFinishReason | undefined;
+};
+
+/**
+ * 上下文压缩，内部会判断是否需要压缩
+ */
+export const onCompressContext = async ({
+  activePlan,
+  isAborted,
+  messageTokens,
+  requestMessages,
+  modelData,
+  reasoningEffort,
+  tools,
+  userKey,
+  teamId
+}: {
+  activePlan?: AgentPlanType;
+  isAborted: RunAgentCallProps['isAborted'];
+  messageTokens?: number;
+  requestMessages: ChatCompletionMessageParam[];
+  modelData: LLMModelDataType;
+  reasoningEffort?: CreateLLMResponseProps['body']['reasoning_effort'];
+  tools?: ChatCompletionTool[];
+  userKey: RunAgentCallProps['userKey'];
+  teamId: RunAgentCallProps['teamId'];
+}) => {
+  const compressStartTime = Date.now();
+  const result = await compressRequestMessages({
+    activePlan,
+    checkIsStopping: isAborted,
+    messageTokens,
+    messages: requestMessages,
+    model: modelData,
+    reasoningEffort,
+    tools,
+    userKey,
+    teamId
+  });
+  if (result.usage || result.contextCheckpoint || result.messages !== requestMessages) {
+    return {
+      messages: result.messages,
+      messageTokens: result.messageTokens,
+      hasCompressedContext: true,
+      usage: result.usage,
+      requestIds: result.requestIds ?? [],
+      seconds: +((Date.now() - compressStartTime) / 1000).toFixed(2),
+      contextCheckpoint: result.contextCheckpoint
+    };
+  }
+
+  return {
+    messages: result.messages,
+    messageTokens: result.messageTokens,
+    hasCompressedContext: false,
+    requestIds: result.requestIds ?? [],
+    seconds: +((Date.now() - compressStartTime) / 1000).toFixed(2)
+  };
+};
+
+/**
+ * 一个循环调用工具的 LLM 请求封装。
+ * 每次循环会进行以下操作：
+ * 1. 压缩请求消息: 如果满足条件则压缩请求消息
+ * 2. 请求 LLM
+ * 3. 调用工具（如有）： Call、Compress response
+ * 4. 检查是否循环结束
+ */
+export const runAgentLoop = async <TChildrenResponse = unknown>({
+  maxRunAgentTimes,
+  completionPolicy,
+  batchToolSize = 1,
+  // 同次 Agent 运行的各轮模型请求共享分类缓存，支持上层传入已有上下文（如 WorkflowFileContext）。
+  fileContext = createFileClassificationContext(),
+  body: { model, messages, max_tokens, ...body },
+
+  userKey,
+  teamId,
+  isAborted,
+
+  onAfterCompressContext,
+  getActivePlan,
+  childrenInteractiveParams,
+  onRunInteractiveTool,
+
+  onToolCall,
+  onToolParam,
+  onToolRunStart,
+  onToolRunEnd,
+  onUserMessage,
+  onRunTool,
+  canBatchTool = () => true,
+  onLLMRequestStart,
+  onLLMRequestEnd,
+
+  onReasoning,
+  onStreaming
+}: RunAgentCallProps<TChildrenResponse>): Promise<RunAgentResponse<TChildrenResponse>> => {
+  const modelData = model;
+
+  let runTimes = 0;
+  let pause: AgentLoopPause<TChildrenResponse> | undefined;
+
+  // Init messages
+  // 本轮产生的 assistantMessages，包括 tool 内产生的
+  const assistantMessages: ChatCompletionMessageParam[] = [];
+  // 多轮运行时候的请求 messages
+  let requestMessages = messages.map((item) => {
+    if (item.role === 'assistant' && item.tool_calls) {
+      return {
+        ...item,
+        tool_calls: item.tool_calls.map((tool) => ({
+          id: tool.id,
+          type: tool.type,
+          function: tool.function
+        }))
+      };
+    }
+    return item;
+  });
+  let requestMessagesTokenCount: number | undefined;
+
+  /**
+   * requestMessages 在未压缩时主要是 append-only。
+   * 已知基线 token 后，只统计新增 message，避免每轮压缩判断都重复统计完整历史。
+   */
+  const appendRequestMessages = async (...newMessages: ChatCompletionMessageParam[]) => {
+    requestMessages.push(...newMessages);
+    if (requestMessagesTokenCount !== undefined && newMessages.length > 0) {
+      requestMessagesTokenCount += await countGptMessagesTokens({
+        messages: newMessages
+      });
+    }
+  };
+
+  let inputTokens: number = 0;
+  let outputTokens: number = 0;
+  let llmTotalPoints: number = 0; // 每次 LLM 调用单独计价后累加，避免梯度计费错误
+  let finish_reason: CompletionFinishReason | undefined;
+  let requestError: any;
+  // Latest checkpoint text generated in this loop; caller persists it as hidden history.
+  let contextCheckpoint: string | undefined;
+
+  // 处理 tool 里的交互
+  if (childrenInteractiveParams) {
+    const toolStartTime = Date.now();
+    const resumedToolCall = requestMessages
+      .flatMap((message) =>
+        message.role === ChatCompletionRequestMessageRoleEnum.Assistant
+          ? message.tool_calls || []
+          : []
+      )
+      .find((call) => call.id === childrenInteractiveParams.toolCallId) ||
+      // 兼容缺少 assistant tool_call 的旧交互快照；callId 仍能用于回填原工具卡片。
+      {
+        id: childrenInteractiveParams.toolCallId,
+        type: 'function' as const,
+        function: {
+          name: '',
+          arguments: ''
+        }
+      };
+    let interactiveToolErrorMessage: string | undefined;
+    const {
+      response,
+      assistantMessages: toolAssistantMessages,
+      assistantResponses: toolAssistantResponses,
+      usages: toolUsages,
+      interactive,
+      stop,
+      errorMessage,
+      metadata
+    } = await (async () => {
+      try {
+        return await onRunInteractiveTool({
+          ...childrenInteractiveParams,
+          call: resumedToolCall,
+          messages: requestMessages
+        });
+      } catch (error) {
+        interactiveToolErrorMessage = `Tool error: ${getErrText(error)}`;
+        return {
+          response: interactiveToolErrorMessage,
+          assistantMessages: [],
+          usages: [],
+          stop: false
+        };
+      }
+    })();
+
+    onToolRunEnd?.({
+      resumed: true,
+      call: resumedToolCall,
+      response: normalizeToolResponseContent(response),
+      assistantMessages: toolAssistantMessages,
+      assistantResponses: toolAssistantResponses,
+      errorMessage: interactiveToolErrorMessage || errorMessage,
+      seconds: +((Date.now() - toolStartTime) / 1000).toFixed(2),
+      usages: toolUsages,
+      metadata,
+      interactive
+    });
+
+    // FastAgent 只使用 ChatItem 重建的上下文，旧交互中的 memory 快照不再参与恢复。
+    requestMessages = requestMessages.map((item) =>
+      item.role === 'tool' && item.tool_call_id === childrenInteractiveParams.toolCallId
+        ? {
+            ...item,
+            content: normalizeToolResponseContent(response)
+          }
+        : item
+    );
+
+    // child interactive 的 tool_call 在上一轮已经产生；恢复后需要把 tool response
+    // 放进本轮 transcript，外层才能回填旧工具卡并保证后续 history 重建使用真实结果。
+    assistantMessages.push({
+      role: ChatCompletionRequestMessageRoleEnum.Tool,
+      tool_call_id: childrenInteractiveParams.toolCallId,
+      content: response
+    });
+    assistantMessages.push(...filterEmptyAssistantMessages(toolAssistantMessages));
+    // 相同 tool 触发了多次交互, 调用的 toolId 认为是相同的
+    if (interactive) {
+      pause = {
+        interactive,
+        toolCallId: childrenInteractiveParams.toolCallId
+      };
+    }
+
+    if (pause || stop) {
+      return {
+        requestIds: [],
+        model: modelData.model,
+        inputTokens: 0,
+        outputTokens: 0,
+        llmTotalPoints: 0,
+        completeMessages: requestMessages,
+        assistantMessages,
+        pause,
+        finish_reason: 'stop'
+      };
+    }
+
+    // 正常完成该工具的响应，继续进行 LLM 调用
+  }
+
+  // Agent loop
+  const requestIds: string[] = [];
+  // 只限制工具顺序和参数长度都连续相同的轮次，避免将正常的多工具任务误判为模型幻觉。
+  let lastConsecutiveToolSignature: string | undefined;
+  let consecutiveSameToolRequestTimes = 0;
+  while (runTimes < maxRunAgentTimes) {
+    let stopAgentLoop = false;
+
+    // 费用限制由 workflow 入口统一校验；这里保留单轮 usage 明细，便于上层累计。
+    runTimes++;
+
+    // 1. Compress request messages
+    {
+      const compressResult = await onCompressContext({
+        activePlan: getActivePlan?.(),
+        isAborted,
+        messageTokens: requestMessagesTokenCount,
+        requestMessages,
+        modelData,
+        reasoningEffort: body.reasoning_effort,
+        tools: body.tools,
+        userKey,
+        teamId
+      });
+      if (compressResult) {
+        requestMessagesTokenCount = compressResult.messageTokens ?? requestMessagesTokenCount;
+        if (compressResult.hasCompressedContext) {
+          requestMessages = compressResult.messages;
+          contextCheckpoint = compressResult.contextCheckpoint ?? contextCheckpoint;
+          onAfterCompressContext?.({
+            usage: compressResult.usage,
+            requestIds: compressResult.requestIds,
+            seconds: compressResult.seconds,
+            contextCheckpoint: compressResult.contextCheckpoint
+          });
+        }
+      }
+    }
+
+    // 工具执行使用本轮请求快照，工具结果随后单独追加到 requestMessages。
+    const cloneRequestMessages = requestMessages.slice();
+
+    // 2. Request LLM
+    const requestStartTime = Date.now();
+    const responseId = getNanoid();
+    let firstTokenTime: number | undefined;
+    onLLMRequestStart?.({
+      responseId,
+      requestIndex: runTimes,
+      modelName: modelData.name
+    });
+    const {
+      requestId,
+      answerText: answer,
+      reasoningText: reasoning,
+      toolCalls = [],
+      usage,
+      responseEmptyTip,
+      assistantMessage: llmAssistantMessage,
+      finish_reason: finishReason,
+      error
+    } = await createLLMResponse({
+      throwError: false,
+      fileContext,
+      body: {
+        ...body,
+        max_tokens,
+        model: modelData,
+        messages: requestMessages,
+        tool_choice: consecutiveSameToolRequestTimes >= 5 ? 'none' : 'auto',
+        toolCallMode: modelData.config.toolChoice ? 'toolChoice' : 'prompt',
+        parallel_tool_calls: body.parallel_tool_calls ?? true
+      },
+      userKey,
+      teamId,
+      isAborted,
+      onReasoning: (event) => {
+        firstTokenTime ??= Date.now();
+        onReasoning?.(event);
+      },
+      onStreaming: (event) => {
+        firstTokenTime ??= Date.now();
+        onStreaming?.(event);
+      },
+      onToolCall,
+      onToolParam
+    });
+    const totalPoints = usage.usedUserOpenAIKey
+      ? 0
+      : formatModelChars2Points({
+          model: modelData,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens
+        }).totalPoints;
+    onLLMRequestEnd?.({
+      responseId,
+      assistantMessage: llmAssistantMessage,
+      requestIndex: runTimes,
+      modelName: modelData.name,
+      requestId,
+      finishReason,
+      answerText: answer,
+      reasoningText: reasoning || llmAssistantMessage?.reasoning_content,
+      toolCalls,
+      usage: {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalPoints
+      },
+      seconds: +((Date.now() - requestStartTime) / 1000).toFixed(2),
+      firstTokenTime:
+        firstTokenTime === undefined
+          ? undefined
+          : +((firstTokenTime - requestStartTime) / 1000).toFixed(2),
+      error: error ?? responseEmptyTip
+    });
+    // 请求后赋值操作
+    {
+      finish_reason = finishReason;
+      requestError = error;
+      requestIds.push(requestId);
+
+      // 错误响应也可能产生消耗，退出前先累计；每轮单独计价以兼容梯度计费。
+      inputTokens += usage.inputTokens;
+      outputTokens += usage.outputTokens;
+      llmTotalPoints += totalPoints;
+
+      if (requestError) {
+        break;
+      }
+      if (answer) {
+        lastConsecutiveToolSignature = undefined;
+        consecutiveSameToolRequestTimes = 0;
+      } else if (toolCalls.length) {
+        const currentToolSignature = toolCalls
+          .map((toolCall) => `${toolCall.function.name}:${toolCall.function.arguments.length}`)
+          .join(',');
+
+        if (currentToolSignature === lastConsecutiveToolSignature) {
+          consecutiveSameToolRequestTimes++;
+        } else {
+          lastConsecutiveToolSignature = currentToolSignature;
+          consecutiveSameToolRequestTimes = 1;
+        }
+      }
+
+      if (responseEmptyTip) {
+        requestError = responseEmptyTip;
+        break;
+      }
+
+      // 推送 AI 生成后的 assistantMessages
+      if (llmAssistantMessage) {
+        assistantMessages.push(llmAssistantMessage);
+        await appendRequestMessages(llmAssistantMessage);
+      }
+    }
+
+    if (toolCalls.length) {
+      // 3. Call tools
+      type ToolRunResult = {
+        tool: ChatCompletionMessageToolCall;
+        interactive?: TChildrenResponse | AgentAskInteractive;
+        stopLoop?: boolean;
+        toolMessage: ChatCompletionMessageParam;
+        toolAssistantMessages: ChatCompletionMessageParam[];
+      };
+
+      const runTool = async ({
+        tool
+      }: {
+        tool: ChatCompletionMessageToolCall;
+      }): Promise<ToolRunResult> => {
+        const toolStartTime = Date.now();
+        let toolErrorMessage: string | undefined;
+        onToolRunStart?.({
+          call: tool
+        });
+        const {
+          response,
+          assistantMessages: toolAssistantMessages,
+          assistantResponses: toolAssistantResponses,
+          usages: toolUsages,
+          interactive,
+          stop: stopLoop,
+          skipResponseCompress,
+          errorMessage,
+          hideInUI,
+          metadata
+        } = await (async () => {
+          try {
+            return await onRunTool({
+              call: tool,
+              messages: cloneRequestMessages,
+              assistantMessage: llmAssistantMessage
+            });
+          } catch (error) {
+            toolErrorMessage = `Tool error: ${getErrText(error)}`;
+            return {
+              response: toolErrorMessage,
+              assistantMessages: [],
+              usages: [],
+              stop: false
+            };
+          }
+        })();
+        // Compress tool response
+        const { toolFinalResponse, toolResponseCompress } = await (async () => {
+          if (skipResponseCompress) {
+            return {
+              toolFinalResponse: normalizeToolResponseContent(response)
+            };
+          }
+
+          const compressStartTime = Date.now();
+          const compressionResult = await compressToolResponse({
+            response,
+            model: modelData,
+            reasoningEffort: body.reasoning_effort,
+            userKey,
+            teamId
+          });
+          const { compressed: compressed_context, usage: compressionUsage } = compressionResult;
+          const normalizedCompressedContext = normalizeToolResponseContent(compressed_context);
+          if (compressionUsage) {
+            return {
+              toolFinalResponse: normalizedCompressedContext,
+              toolResponseCompress: {
+                response: normalizedCompressedContext,
+                modelName: modelData.name,
+                usage: compressionUsage,
+                requestIds: compressionResult.requestIds ?? [],
+                seconds: +((Date.now() - compressStartTime) / 1000).toFixed(2)
+              }
+            };
+          }
+
+          return {
+            toolFinalResponse: normalizedCompressedContext
+          };
+        })();
+
+        onToolRunEnd?.({
+          call: tool,
+          response: toolFinalResponse,
+          assistantMessages: toolAssistantMessages,
+          assistantResponses: toolAssistantResponses,
+          ...(toolErrorMessage || errorMessage
+            ? { errorMessage: toolErrorMessage || errorMessage }
+            : {}),
+          seconds: +((Date.now() - toolStartTime) / 1000).toFixed(2),
+          usages: [...toolUsages, ...(toolResponseCompress ? [toolResponseCompress.usage] : [])],
+          toolResponseCompress,
+          metadata,
+          hideInUI,
+          interactive
+        });
+
+        return {
+          tool,
+          interactive,
+          stopLoop,
+          toolMessage: {
+            tool_call_id: tool.id,
+            role: ChatCompletionRequestMessageRoleEnum.Tool,
+            content: toolFinalResponse
+          } as ChatCompletionMessageParam,
+          toolAssistantMessages: filterEmptyAssistantMessages(toolAssistantMessages)
+        };
+      };
+
+      // 按 toolCalls 原始顺序写回工具结果，保证后续 LLM 上下文稳定。
+      const appendToolRunResults = async (toolRunResults: ToolRunResult[]) => {
+        for (const {
+          tool,
+          interactive,
+          stopLoop,
+          toolMessage,
+          toolAssistantMessages
+        } of toolRunResults) {
+          if (interactive) {
+            pause = {
+              interactive,
+              toolCallId: tool.id
+            };
+          }
+          if (stopLoop) {
+            stopAgentLoop = true;
+          }
+
+          assistantMessages.push(toolMessage);
+          await appendRequestMessages(toolMessage);
+          // toolAssistantMessages 也需要记录成 AI 响应，所以这里需要推送。
+          assistantMessages.push(...toolAssistantMessages);
+        }
+      };
+
+      const safeBatchToolSize = Math.max(1, batchToolSize);
+      let toolIndex = 0;
+
+      while (toolIndex < toolCalls.length) {
+        const currentTool = toolCalls[toolIndex];
+
+        // 只能串行的工具
+        if (!canBatchTool(currentTool)) {
+          const result = await runTool({
+            tool: currentTool
+          });
+          await appendToolRunResults([result]);
+          toolIndex++;
+
+          // 交互或 stop 工具已经决定暂停当前 loop，不能再执行同一轮中排在后面的工具，
+          // 否则会在用户回答前产生额外副作用，且恢复上下文无法准确反映实际执行顺序。
+          if (pause || stopAgentLoop || isAborted?.()) {
+            break;
+          }
+          continue;
+        }
+
+        // 可并行的工具一起执行
+        const batchTools: ChatCompletionMessageToolCall[] = [];
+        while (
+          toolIndex < toolCalls.length &&
+          batchTools.length < safeBatchToolSize &&
+          canBatchTool(toolCalls[toolIndex])
+        ) {
+          batchTools.push(toolCalls[toolIndex]);
+          toolIndex++;
+        }
+
+        const toolRunResults = await batchRun(
+          batchTools,
+          async (tool) =>
+            runTool({
+              tool
+            }),
+          safeBatchToolSize
+        );
+        await appendToolRunResults(toolRunResults);
+
+        // 同一并发批次已经启动的工具无法撤回，但后续批次不应在暂停信号后继续调度。
+        if (pause || stopAgentLoop || isAborted?.()) {
+          break;
+        }
+      }
+
+      // 暂停之后的调用尚未执行，显式记录跳过结果，保证原始多工具消息始终完整配对。
+      for (const tool of toolCalls.slice(toolIndex)) {
+        const response =
+          'Tool was not executed because a preceding tool paused or stopped the loop.';
+        const toolMessage: ChatCompletionMessageParam = {
+          role: ChatCompletionRequestMessageRoleEnum.Tool,
+          tool_call_id: tool.id,
+          content: response
+        };
+        assistantMessages.push(toolMessage);
+        await appendRequestMessages(toolMessage);
+        onToolRunEnd?.({ call: tool, response, seconds: 0 });
+      }
+    }
+
+    // 暂停、工具显式停止和取消优先于业务完成判断。
+    if (pause || stopAgentLoop || isAborted?.()) {
+      break;
+    }
+    if (toolCalls.length > 0) {
+      continue;
+    }
+
+    // 只有模型自然结束时，才由业务策略决定是否追加指令继续。
+    try {
+      if (!completionPolicy) break;
+      const decision = await completionPolicy({ requestIndex: runTimes });
+      // 策略可能异步执行，等待期间的取消不能触发下一轮请求。
+      if (isAborted?.() || decision.action === 'complete') {
+        break;
+      }
+      // 续跑指令是服务端输入，按 User 角色落库；不伪造模型工具调用，也不提升为 System。
+      const message: ChatCompletionMessageParam = {
+        role: ChatCompletionRequestMessageRoleEnum.User,
+        content: decision.message,
+        hideInUI: true
+      };
+      assistantMessages.push(message);
+      await appendRequestMessages(message);
+      onUserMessage?.({ content: decision.message, source: 'server' });
+      if (runTimes >= maxRunAgentTimes) {
+        requestError = new Error(`Agent loop reached max run times: ${maxRunAgentTimes}`);
+        break;
+      }
+    } catch (error) {
+      requestError = error;
+      break;
+    }
+  }
+
+  return {
+    requestIds,
+    error: requestError,
+    model: modelData.model,
+    inputTokens,
+    outputTokens,
+    llmTotalPoints,
+    contextCheckpoint,
+    completeMessages: requestMessages,
+    assistantMessages,
+    pause,
+    finish_reason
+  };
+};

@@ -1,0 +1,35 @@
+import type { ReferencedAppsResponse } from '@fastgpt/global/core/app/type';
+import { GET, POST } from '@/web/common/api/request';
+import type {
+  CopyAppBodyType,
+  CopyAppResponseType,
+  GetReferencedAppsQuery,
+  TransitionWorkflowBodyType,
+  TransitionWorkflowResponseType
+} from '@fastgpt/global/openapi/core/app/common/api';
+import type {
+  CreateAppFolderBodyType,
+  GetAppFolderPathQueryType,
+  GetAppFolderPathResponseType
+} from '@fastgpt/global/openapi/core/app/folder/api';
+
+/* folder */
+export const postCreateAppFolder = (data: CreateAppFolderBodyType) =>
+  POST<void>('/core/app/folder/create', data);
+
+export const getAppFolderPath = (data: GetAppFolderPathQueryType) => {
+  if (!data.sourceId) return Promise.resolve<GetAppFolderPathResponseType>([]);
+
+  return GET<GetAppFolderPathResponseType>(`/core/app/folder/path`, data);
+};
+
+/* detail */
+export const postTransition2Workflow = (data: TransitionWorkflowBodyType) =>
+  POST<TransitionWorkflowResponseType>('/core/app/transitionWorkflow', data);
+
+export const postCopyApp = (data: CopyAppBodyType) =>
+  POST<CopyAppResponseType>('/core/app/copy', data);
+
+/* referenced apps */
+export const getReferencedApps = (params: GetReferencedAppsQuery) =>
+  GET<ReferencedAppsResponse>('/core/app/referencedApps', params);

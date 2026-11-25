@@ -1,0 +1,87 @@
+import type { AppFormEditFormType } from '@fastgpt/global/core/app/formEdit/type';
+import { NodeInputKeyEnum } from '@fastgpt/global/core/workflow/constants';
+import { getDefaultAppForm } from '@fastgpt/global/core/app/utils';
+import { AppTypeEnum } from '@fastgpt/global/core/app/constants';
+import { ModelTypeEnum } from '@fastgpt/global/core/ai/constants';
+import { isSystemModel } from '@fastgpt/global/core/ai/model/utils';
+import type { MyModelItemType } from '@fastgpt/global/openapi/core/ai/model/api';
+import { addModelNamesToWorkflow } from '@fastgpt/global/common/workflow/model';
+
+export const WORKFLOW_BUILDER_AUTO_OPEN_QUERY_KEY = 'openWorkflowBuilder';
+export const WORKFLOW_BUILDER_CHAT_ID_QUERY_KEY = 'workflowBuilderChatId';
+
+/** 生成应用详情页路由，并按需携带只在首次进入时消费的 Builder 自动开启标记。 */
+export const getAppDetailRoute = ({
+  appId,
+  openWorkflowBuilder = false
+}: {
+  appId: string;
+  openWorkflowBuilder?: boolean;
+}) => ({
+  pathname: '/app/detail',
+  query: {
+    appId,
+    ...(openWorkflowBuilder ? { [WORKFLOW_BUILDER_AUTO_OPEN_QUERY_KEY]: '1' } : {})
+  }
+});
+
+/** 判断应用是否使用工作流画布编辑器。 */
+export const isWorkflowAppType = (appType: AppTypeEnum) =>
+  appType === AppTypeEnum.workflow || appType === AppTypeEnum.workflowTool;
+
+export function filterSensitiveFormData(appForm: AppFormEditFormType) {
+  // 当前导出脱敏范围与历史基线保持一致，仅处理数据集选择和系统密钥输入；工具配置暂不做递归脱敏，避免误删普通 value/defaultValue。
+  const defaultAppForm = getDefaultAppForm();
+  return {
+    ...appForm,
+    dataset: defaultAppForm.dataset,
+    selectedTools: appForm.selectedTools.map((tool) => ({
+      ...tool,
+      inputs: tool.inputs.map((input) => ({
+        ...input,
+        value: input.key === NodeInputKeyEnum.systemInputConfig ? undefined : input.value
+      }))
+    }))
+  };
+}
+
+/** 为简易应用导出补充可跨环境匹配的系统模型名称，并保留原 modelId。 */
+export function addModelNamesToAppForm({
+  appForm,
+  models
+}: {
+  appForm: AppFormEditFormType;
+  models: MyModelItemType[];
+}) {
+  const getModelName = ({ modelId, type }: { modelId?: string; type: ModelTypeEnum }) => {
+    if (typeof modelId !== 'string' || /^\{\{.*\}\}$/.test(modelId)) return;
+    return models.find(
+      (item) => isSystemModel(item) && item.modelId === modelId && item.type === type
+    )?.model;
+  };
+
+  const aiModel = getModelName({
+    modelId: appForm.aiSettings[NodeInputKeyEnum.aiModelId],
+    type: ModelTypeEnum.llm
+  });
+  if (aiModel !== undefined) appForm.aiSettings[NodeInputKeyEnum.aiModel] = aiModel;
+
+  const rerankModel = getModelName({
+    modelId: appForm.dataset[NodeInputKeyEnum.datasetSearchRerankModelId],
+    type: ModelTypeEnum.rerank
+  });
+  if (rerankModel !== undefined) {
+    appForm.dataset[NodeInputKeyEnum.datasetSearchRerankModel] = rerankModel;
+  }
+
+  const extensionModel = getModelName({
+    modelId: appForm.dataset[NodeInputKeyEnum.datasetSearchExtensionModelId],
+    type: ModelTypeEnum.llm
+  });
+  if (extensionModel !== undefined) {
+    appForm.dataset[NodeInputKeyEnum.datasetSearchExtensionModel] = extensionModel;
+  }
+  addModelNamesToWorkflow({ nodes: [], chatConfig: appForm.chatConfig, models });
+
+  return appForm;
+}

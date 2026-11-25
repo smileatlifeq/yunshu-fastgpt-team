@@ -1,0 +1,915 @@
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { FlowNodeTypeEnum } from '@fastgpt/global/core/workflow/node/constant';
+import {
+  dispatchRunTool,
+  parseToolId
+} from '@fastgpt/service/core/workflow/dispatch/child/runTool';
+import { ReadPermissionVal } from '@fastgpt/global/support/permission/constant';
+import { NodeOutputKeyEnum, VARIABLE_NODE_ID } from '@fastgpt/global/core/workflow/constants';
+import { SystemToolSecretInputTypeEnum } from '@fastgpt/global/core/app/tool/systemTool/constants';
+import { MCPClient } from '@fastgpt/service/core/app/mcp';
+import { getWorkflowResourceContext } from '@fastgpt/service/core/workflow/utils/context';
+import { AppErrEnum } from '@fastgpt/global/common/error/code/app';
+import { UserConfigError } from '@fastgpt/global/common/error/utils';
+import { pushTrack } from '@fastgpt/service/common/middle/tracks/utils';
+
+const {
+  authAppByTmbIdMock,
+  getAppVersionByIdMock,
+  getHTTPToolListMock,
+  getMCPChildrenMock,
+  runHTTPToolMock,
+  mcpToolCallMock,
+  runToolStreamMock,
+  getSystemToolRuntimeMock,
+  getSystemToolDetailMock,
+  workflowContextMock,
+  mockLogger
+} = vi.hoisted(() => ({
+  authAppByTmbIdMock: vi.fn(),
+  getAppVersionByIdMock: vi.fn(),
+  getHTTPToolListMock: vi.fn(),
+  getMCPChildrenMock: vi.fn(),
+  runHTTPToolMock: vi.fn(),
+  mcpToolCallMock: vi.fn(),
+  runToolStreamMock: vi.fn(),
+  getSystemToolRuntimeMock: vi.fn(),
+  getSystemToolDetailMock: vi.fn(),
+  workflowContextMock: { mcpClientMemory: {} as Record<string, unknown> },
+  mockLogger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+}));
+
+vi.mock('@fastgpt/service/support/permission/app/auth', () => ({
+  authAppByTmbId: authAppByTmbIdMock
+}));
+
+vi.mock('@fastgpt/service/core/app/version/controller', () => ({
+  getAppVersionById: getAppVersionByIdMock
+}));
+
+vi.mock('@fastgpt/service/core/app/http', () => ({
+  getHTTPToolList: getHTTPToolListMock,
+  runHTTPTool: runHTTPToolMock
+}));
+
+vi.mock('@fastgpt/service/core/app/mcp', () => ({
+  assertMCPUrlNotInternal: vi.fn(),
+  getMCPChildren: getMCPChildrenMock,
+  normalizeLegacyMcpHeaderSecret: (headerSecret: any) => {
+    if (!headerSecret || typeof headerSecret !== 'object') return undefined;
+    if ('value' in headerSecret || 'secret' in headerSecret || 'ref' in headerSecret) {
+      return { Authorization: headerSecret };
+    }
+    return headerSecret;
+  },
+  MCPClient: vi.fn(function () {
+    return { toolCall: mcpToolCallMock };
+  })
+}));
+
+vi.mock('@fastgpt/service/common/logger', () => {
+  const logCategories = new Proxy({}, { get: () => logCategories });
+  return {
+    LogCategories: logCategories,
+    getLogger: vi.fn(() => mockLogger)
+  };
+});
+
+vi.mock('@fastgpt/service/common/middle/tracks/utils', () => ({
+  pushTrack: {
+    runSystemTool: vi.fn()
+  }
+}));
+
+vi.mock('@fastgpt/service/thirdProvider/fastgptPlugin', () => ({
+  pluginClient: {
+    runToolStream: runToolStreamMock
+  }
+}));
+
+vi.mock('@fastgpt/service/core/app/tool/systemTool/systemTool.repo', () => ({
+  SystemToolRepo: {
+    getInstance: vi.fn(() => ({
+      getSystemToolRuntime: getSystemToolRuntimeMock,
+      getSystemToolDetail: getSystemToolDetailMock
+    }))
+  }
+}));
+
+vi.mock('@fastgpt/service/core/workflow/utils/context', () => ({
+  getWorkflowContext: vi.fn(() => workflowContextMock),
+  getWorkflowResourceContext: vi.fn(() => undefined)
+}));
+
+const createRunToolProps = (
+  toolConfig: Record<string, any>,
+  params: Record<string, any> = { keyword: 'fastgpt' }
+) =>
+  ({
+    params,
+    runningAppInfo: {
+      id: 'attacker-app',
+      teamId: 'attacker-team',
+      tmbId: 'attacker-tmb',
+      name: 'Attacker workflow'
+    },
+    runningUserInfo: {
+      username: 'attacker',
+      teamName: 'Attacker team',
+      memberName: 'Attacker member',
+      contact: '',
+      teamId: 'attacker-team',
+      // 调用者与应用创建者不同；工具引用按当前运行人鉴权。
+      tmbId: 'caller-without-toolset-permission'
+    },
+    variableState: {
+      get: vi.fn()
+    },
+    node: {
+      nodeId: 'tool-node',
+      flowNodeType: FlowNodeTypeEnum.tool,
+      name: 'Tool node',
+      avatar: '',
+      toolConfig,
+      inputs: [],
+      outputs: []
+    },
+    uid: 'uid',
+    chatId: 'chat',
+    responseChatItemId: 'response',
+    usagePush: vi.fn()
+  }) as any;
+
+describe('dispatchRunTool runtime toolset auth', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workflowContextMock.mcpClientMemory = {};
+    mcpToolCallMock.mockResolvedValue({ ok: true });
+    vi.mocked(getWorkflowResourceContext).mockReturnValue(undefined);
+    authAppByTmbIdMock.mockResolvedValue({
+      app: {
+        _id: 'victim-toolset',
+        modules: []
+      }
+    });
+    getAppVersionByIdMock.mockImplementation(({ app }: { app?: any }) =>
+      Promise.resolve({
+        nodes: app?.modules ?? [],
+        edges: app?.edges ?? [],
+        chatConfig: app?.chatConfig
+      })
+    );
+    getHTTPToolListMock.mockResolvedValue([]);
+    getMCPChildrenMock.mockResolvedValue([]);
+    getSystemToolRuntimeMock.mockResolvedValue({
+      id: 'search',
+      version: '1.0.0',
+      currentCost: 0,
+      systemKeyCost: 0
+    });
+    getSystemToolDetailMock.mockResolvedValue({ inputSchema: undefined });
+    runToolStreamMock.mockResolvedValue({ output: { ok: true } });
+  });
+
+  it.each([
+    { source: 'mcp', failure: 'id', message: 'Invalid MCP tool id: invalid-id' },
+    { source: 'mcp', failure: 'set', message: 'MCP tool set is missing' },
+    { source: 'mcp', failure: 'tool', message: 'MCP tool missing not found' },
+    { source: 'mcp', failure: 'url', message: 'MCP tool set URL is missing' },
+    { source: 'http', failure: 'id', message: 'Invalid HTTP tool id: invalid-id' },
+    { source: 'http', failure: 'set', message: 'HTTP tool set not found' },
+    { source: 'http', failure: 'tool', message: 'HTTP tool missing not found' }
+  ])('reports $source $failure failures as system errors', async ({ source, failure, message }) => {
+    const tool = { name: 'available', description: 'Tool', path: '/search', method: 'GET' };
+    getAppVersionByIdMock.mockResolvedValue({
+      nodes:
+        failure === 'set'
+          ? []
+          : [
+              {
+                toolConfig: {
+                  mcpToolSet: {
+                    url: failure === 'url' ? '' : 'https://example.com/mcp',
+                    toolList: [tool]
+                  },
+                  httpToolSet: { baseUrl: 'https://example.com', toolList: [tool] }
+                }
+              }
+            ]
+    });
+    getMCPChildrenMock.mockResolvedValue([tool]);
+    getHTTPToolListMock.mockResolvedValue([tool]);
+    const toolId =
+      failure === 'id'
+        ? 'invalid-id'
+        : `${source}-victim-toolset/${failure === 'tool' ? 'missing' : 'available'}`;
+
+    const result = await dispatchRunTool(
+      createRunToolProps({ [source === 'mcp' ? 'mcpTool' : 'httpTool']: { toolId } })
+    );
+
+    expect(result.rawError).toBeInstanceOf(Error);
+    expect(result.rawError).not.toBeInstanceOf(UserConfigError);
+    expect(result.rawError).toMatchObject({ name: 'Error', message });
+    expect(result.error?.[NodeOutputKeyEnum.errorText]).toBe(message);
+    expect(mockLogger.error).toHaveBeenCalledExactlyOnceWith('Tool Run Error', {
+      error: result.rawError
+    });
+    expect(mcpToolCallMock).not.toHaveBeenCalled();
+    expect(runHTTPToolMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['mcp', 'http'] as const)(
+    'executes a %s child authorized by the member outside the snapshot selection',
+    async (source) => {
+      const tool = {
+        name: 'search',
+        description: 'Search documents',
+        path: '/search',
+        method: 'GET',
+        inputSchema: { type: 'object', properties: { keyword: { type: 'string' } } },
+        requestSchema: { type: 'object', properties: { keyword: { type: 'string' } } }
+      };
+      getAppVersionByIdMock.mockResolvedValue({
+        nodes: [
+          {
+            toolConfig: {
+              [source === 'mcp' ? 'mcpToolSet' : 'httpToolSet']: {
+                url: 'https://example.com/mcp',
+                baseUrl: 'https://example.com',
+                toolList: [tool]
+              }
+            }
+          }
+        ]
+      });
+      getMCPChildrenMock.mockResolvedValue([tool]);
+      getHTTPToolListMock.mockResolvedValue([tool]);
+      mcpToolCallMock.mockResolvedValue({ ok: true });
+      runHTTPToolMock.mockResolvedValue({ data: { ok: true } });
+      vi.mocked(getWorkflowResourceContext).mockReturnValue({
+        isRoot: false,
+        resourceMap: new Map([
+          [
+            'tool:victim-toolset',
+            {
+              type: 'tool',
+              id: 'victim-toolset',
+              data: { toolNames: ['staticTool'] }
+            }
+          ]
+        ])
+      });
+      const props = createRunToolProps({
+        [source === 'mcp' ? 'mcpTool' : 'httpTool']: { toolId: `${source}-victim-toolset/search` }
+      });
+
+      const result = await dispatchRunTool(props);
+      expect(result.error).toBeUndefined();
+      const execute = source === 'mcp' ? mcpToolCallMock : runHTTPToolMock;
+      expect(execute).toHaveBeenCalledOnce();
+      expect(authAppByTmbIdMock).toHaveBeenCalledOnce();
+
+      execute.mockClear();
+      authAppByTmbIdMock.mockRejectedValueOnce(AppErrEnum.unAuthApp);
+      const denied = await dispatchRunTool(props);
+      expect(denied.error?.[NodeOutputKeyEnum.errorText]).toBeTruthy();
+      expect(execute).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    {
+      keyType: SystemToolSecretInputTypeEnum.system,
+      expectedPoints: 5,
+      title: 'system key'
+    },
+    {
+      keyType: SystemToolSecretInputTypeEnum.manual,
+      expectedPoints: 2,
+      title: 'manual key'
+    }
+  ])('charges call cost and key-dependent cost for $title', async ({ keyType, expectedPoints }) => {
+    getSystemToolRuntimeMock.mockResolvedValueOnce({
+      id: 'search',
+      version: '1.0.0',
+      currentCost: 2,
+      systemKeyCost: 3,
+      secretsVal: {}
+    });
+    const props = createRunToolProps(
+      {
+        systemTool: {
+          toolId: 'systemTool-search'
+        }
+      },
+      {
+        keyword: 'fastgpt',
+        system_input_config: {
+          type: keyType,
+          value: {}
+        }
+      }
+    );
+
+    await dispatchRunTool(props);
+
+    expect(props.usagePush).toHaveBeenCalledWith([
+      {
+        moduleName: 'Tool node',
+        totalPoints: expectedPoints
+      }
+    ]);
+    expect(pushTrack.runSystemTool).toHaveBeenCalledWith({
+      teamId: props.runningUserInfo.teamId,
+      tmbId: props.runningUserInfo.tmbId,
+      toolId: 'search',
+      result: 1,
+      usagePoint: expectedPoints,
+      msg: ''
+    });
+  });
+
+  it('should reject HTTP tool execution when running app tmb has no parent toolset permission', async () => {
+    authAppByTmbIdMock.mockRejectedValueOnce(new Error('unAuthApp'));
+
+    const result = await dispatchRunTool(
+      createRunToolProps({
+        httpTool: {
+          toolId: 'http-victim-toolset/sandbox_echo'
+        }
+      })
+    );
+
+    expect(authAppByTmbIdMock).toHaveBeenCalledWith({
+      tmbId: 'caller-without-toolset-permission',
+      appId: 'victim-toolset',
+      per: ReadPermissionVal
+    });
+    expect(runHTTPToolMock).not.toHaveBeenCalled();
+    expect(result.error?.[NodeOutputKeyEnum.errorText]).toBeTruthy();
+  });
+
+  it('should authorize HTTP parent toolset before loading version and running tool', async () => {
+    authAppByTmbIdMock.mockResolvedValueOnce({
+      app: {
+        _id: 'victim-toolset',
+        modules: [
+          {
+            toolConfig: {
+              httpToolSet: {
+                baseUrl: 'https://example.com',
+                toolList: [
+                  {
+                    name: 'sandbox_echo',
+                    description: 'Sandbox echo',
+                    path: '/echo',
+                    method: 'post'
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    });
+    getHTTPToolListMock.mockResolvedValueOnce([
+      {
+        name: 'sandbox_echo',
+        path: '/echo',
+        method: 'post'
+      }
+    ]);
+    runHTTPToolMock.mockResolvedValueOnce({
+      data: {
+        ok: true
+      }
+    });
+
+    const result = await dispatchRunTool(
+      createRunToolProps({
+        httpTool: {
+          toolId: 'http-victim-toolset/sandbox_echo'
+        }
+      })
+    );
+
+    expect(authAppByTmbIdMock).toHaveBeenCalledWith({
+      tmbId: 'caller-without-toolset-permission',
+      appId: 'victim-toolset',
+      per: ReadPermissionVal
+    });
+    expect(runHTTPToolMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        baseUrl: 'https://example.com',
+        toolPath: '/echo',
+        method: 'post'
+      })
+    );
+    expect(result.data).toEqual({
+      [NodeOutputKeyEnum.rawResponse]: {
+        ok: true
+      },
+      ok: true
+    });
+  });
+
+  it('should pass HTTP params through without validating against the toolset schema', async () => {
+    authAppByTmbIdMock.mockResolvedValueOnce({
+      app: {
+        _id: 'victim-toolset',
+        modules: [
+          {
+            toolConfig: {
+              httpToolSet: {
+                baseUrl: 'https://example.com',
+                toolList: [
+                  {
+                    name: 'sandbox_echo',
+                    description: 'Sandbox echo',
+                    path: '/echo',
+                    method: 'post',
+                    requestSchema: {
+                      type: 'object',
+                      properties: { keyword: { type: 'string', pattern: '^allowed$' } },
+                      required: ['keyword']
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    });
+    getHTTPToolListMock.mockResolvedValueOnce([
+      {
+        name: 'sandbox_echo',
+        path: '/echo',
+        method: 'post',
+        requestSchema: {
+          type: 'object',
+          properties: { keyword: { type: 'string', pattern: '^allowed$' } },
+          required: ['keyword']
+        }
+      }
+    ]);
+    runHTTPToolMock.mockResolvedValueOnce({ data: { ok: true } });
+
+    const props = createRunToolProps(
+      { httpTool: { toolId: 'http-victim-toolset/sandbox_echo' } },
+      { keyword: 'blocked', extra: true }
+    );
+    props.node.jsonSchema = {
+      type: 'object',
+      properties: { keyword: { type: 'string' } },
+      required: ['keyword']
+    };
+
+    const result = await dispatchRunTool(props);
+
+    expect(result.error).toBeUndefined();
+    expect(runHTTPToolMock).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ params: { keyword: 'blocked', extra: true } })
+    );
+  });
+
+  it('should reject MCP tool execution when running app tmb has no parent toolset permission', async () => {
+    authAppByTmbIdMock.mockRejectedValueOnce(new Error('unAuthApp'));
+
+    const result = await dispatchRunTool(
+      createRunToolProps({
+        mcpTool: {
+          toolId: 'mcp-victim-toolset/search'
+        }
+      })
+    );
+
+    expect(authAppByTmbIdMock).toHaveBeenCalledWith({
+      tmbId: 'caller-without-toolset-permission',
+      appId: 'victim-toolset',
+      per: ReadPermissionVal
+    });
+    expect(mcpToolCallMock).not.toHaveBeenCalled();
+    expect(result.error?.[NodeOutputKeyEnum.errorText]).toBeTruthy();
+  });
+
+  it.each([false, true])('preserves modern MCP results and detects isError=%s', async (isError) => {
+    authAppByTmbIdMock.mockResolvedValueOnce({
+      app: {
+        _id: 'victim-toolset',
+        modules: [
+          {
+            toolConfig: {
+              mcpToolSet: {
+                url: 'https://mcp.example.com',
+                toolList: [
+                  {
+                    name: 'search',
+                    description: 'Search',
+                    inputSchema: {
+                      type: 'object',
+                      properties: { query: { type: 'string' } },
+                      required: ['query']
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    });
+    getMCPChildrenMock.mockResolvedValueOnce([
+      {
+        name: 'search',
+        description: 'Search',
+        inputSchema: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query']
+        }
+      }
+    ]);
+
+    const toolResult = { isError, content: [{ type: 'text', text: 'MCP call failed' }] };
+    mcpToolCallMock.mockResolvedValueOnce(toolResult);
+    const result = await dispatchRunTool(
+      createRunToolProps({ mcpTool: { toolId: 'mcp-victim-toolset/search' } }, { extra: true })
+    );
+
+    expect(result.error?.[NodeOutputKeyEnum.errorText]).toBe(
+      isError ? 'MCP call failed' : undefined
+    );
+    expect(result.responseData?.errorText).toBe(isError ? 'MCP call failed' : undefined);
+    expect(result.rawError).toBeUndefined();
+    expect(result.data?.[NodeOutputKeyEnum.rawResponse]).toEqual(toolResult);
+    expect(result.responseData?.toolRes).toEqual(toolResult);
+    expect(result.toolResponse).toEqual(toolResult);
+    expect(mcpToolCallMock).toHaveBeenCalledExactlyOnceWith({
+      toolName: 'search',
+      params: { extra: true },
+      closeConnection: false
+    });
+  });
+
+  it('should preserve MCP user config errors for centralized log classification', async () => {
+    authAppByTmbIdMock.mockResolvedValueOnce({
+      app: {
+        _id: 'victim-toolset',
+        modules: [
+          {
+            toolConfig: {
+              mcpToolSet: {
+                url: 'https://mcp.example.com',
+                toolList: [
+                  {
+                    name: 'search',
+                    description: 'Search',
+                    inputSchema: { type: 'object', properties: {} }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    });
+    getMCPChildrenMock.mockResolvedValueOnce([
+      {
+        name: 'search',
+        description: 'Search',
+        inputSchema: { type: 'object', properties: {} }
+      }
+    ]);
+    mcpToolCallMock.mockRejectedValueOnce(new UserConfigError('Invalid MCP URL'));
+
+    const result = await dispatchRunTool(
+      createRunToolProps({ mcpTool: { toolId: 'mcp-victim-toolset/search' } })
+    );
+
+    expect(result.error?.[NodeOutputKeyEnum.errorText]).toBe('Invalid MCP URL');
+    expect(mockLogger.error).toHaveBeenCalledWith('Tool Run Error', { error: result.rawError });
+  });
+
+  it('resolves MCP auth references per call and reuses clients for matching auth', async () => {
+    const url = 'https://mcp.example.com';
+    const mcpTool = { name: 'search', description: 'Search' };
+    authAppByTmbIdMock.mockResolvedValue({
+      app: {
+        _id: 'victim-toolset',
+        modules: [
+          {
+            toolConfig: {
+              mcpToolSet: {
+                url,
+                headerSecret: {
+                  Authorization: { ref: [VARIABLE_NODE_ID, 'token'] }
+                },
+                toolList: [mcpTool]
+              }
+            }
+          }
+        ]
+      }
+    });
+    getMCPChildrenMock.mockResolvedValue([mcpTool]);
+
+    let token = 'token-a';
+    const props = createRunToolProps({ mcpTool: { toolId: 'mcp-victim-toolset/search' } });
+    props.runtimeNodesMap = {};
+    props.variableState.toRuntimeRecord = () => ({ token });
+
+    await dispatchRunTool(props);
+    token = 'token-b';
+    await dispatchRunTool(props);
+    await dispatchRunTool(props);
+
+    expect(MCPClient).toHaveBeenNthCalledWith(1, {
+      url,
+      headers: { Authorization: 'token-a' }
+    });
+    expect(MCPClient).toHaveBeenNthCalledWith(2, {
+      url,
+      headers: { Authorization: 'token-b' }
+    });
+    expect(MCPClient).toHaveBeenCalledTimes(2);
+    expect(mcpToolCallMock).toHaveBeenCalledTimes(3);
+    expect(Object.keys(workflowContextMock.mcpClientMemory)).toHaveLength(2);
+    expect(Object.keys(workflowContextMock.mcpClientMemory).join(' ')).not.toContain('token-');
+  });
+
+  it.each(['toolData', 'system_toolData'] as const)(
+    'should keep the baseline fallback for legacy single MCP tool params (%s)',
+    async (legacyKey) => {
+      const props = createRunToolProps({});
+      props.params = {
+        query: 'fastgpt',
+        [legacyKey]: {
+          name: 'search',
+          url: 'https://mcp.example.com',
+          headerSecret: { Authorization: { value: 'legacy-token' }, 'X-Key': { value: 'api-key' } },
+          inputSchema: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query']
+          }
+        }
+      };
+      mcpToolCallMock.mockResolvedValueOnce({ ok: true });
+
+      const result = await dispatchRunTool(props);
+      expect(result.error).toBeUndefined();
+      expect(MCPClient).toHaveBeenCalledWith({
+        url: 'https://mcp.example.com',
+        headers: { Authorization: 'legacy-token', 'X-Key': 'api-key' }
+      });
+      expect(mcpToolCallMock).toHaveBeenCalledWith({
+        toolName: 'search',
+        params: { query: 'fastgpt' }
+      });
+    }
+  );
+
+  it('should normalize a legacy single MCP header secret', async () => {
+    const props = createRunToolProps({});
+    props.params = {
+      query: 'fastgpt',
+      toolData: {
+        name: 'search',
+        url: 'https://mcp.example.com',
+        headerSecret: { value: 'legacy-token' },
+        inputSchema: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query']
+        }
+      }
+    };
+    mcpToolCallMock.mockResolvedValueOnce({ ok: true });
+
+    const result = await dispatchRunTool(props);
+
+    expect(result.error).toBeUndefined();
+    expect(MCPClient).toHaveBeenCalledWith({
+      url: 'https://mcp.example.com',
+      headers: { Authorization: 'legacy-token' }
+    });
+  });
+
+  it('should pass system tool params through without validating against the tool schema', async () => {
+    getSystemToolDetailMock.mockResolvedValueOnce({
+      inputSchema: {
+        type: 'object',
+        properties: { keyword: { type: 'string', minLength: 20 } },
+        required: ['keyword']
+      }
+    });
+
+    const result = await dispatchRunTool(createRunToolProps({ systemTool: { toolId: 'search' } }));
+
+    expect(result.error).toBeUndefined();
+    expect(runToolStreamMock).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ input: { keyword: 'fastgpt' } })
+    );
+  });
+});
+
+describe('parseToolId', () => {
+  describe('新版格式: source-appId/toolName', () => {
+    it('should parse mcp tool format correctly', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011/apiTool');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('apiTool');
+    });
+
+    it('should parse http tool format correctly', () => {
+      const result = parseToolId('http-507f1f77bcf86cd799439011/weatherAPI');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('weatherAPI');
+    });
+
+    it('should handle tool names with special characters', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011/api-tool_v2');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('api-tool_v2');
+    });
+
+    it('should handle tool names with numbers', () => {
+      const result = parseToolId('http-507f1f77bcf86cd799439011/tool123');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('tool123');
+    });
+  });
+
+  describe('旧版格式: source-appId/toolsetName/toolName', () => {
+    it('should parse old mcp format correctly', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011/toolset/apiTool');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('apiTool');
+    });
+
+    it('should parse old http format correctly', () => {
+      const result = parseToolId('http-507f1f77bcf86cd799439011/MyToolset/weatherAPI');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('weatherAPI');
+    });
+
+    it('should ignore toolset name in old format', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011/ignoredToolset/actualTool');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('actualTool');
+    });
+
+    it('should handle toolset names with special characters', () => {
+      const result = parseToolId('http-507f1f77bcf86cd799439011/tool-set_v1/myTool');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('myTool');
+    });
+  });
+
+  describe('边界情况', () => {
+    it('should handle appId with hyphens', () => {
+      const result = parseToolId('mcp-507f-1f77-bcf8-6cd7-99439011/tool');
+      expect(result.parentId).toBe('507f-1f77-bcf8-6cd7-99439011');
+      expect(result.toolName).toBe('tool');
+    });
+
+    it('should handle multiple hyphens in source prefix', () => {
+      const result = parseToolId('custom-source-507f1f77bcf86cd799439011/tool');
+      expect(result.parentId).toBe('source-507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('tool');
+    });
+
+    it('should handle tool names with slashes in old format', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011/toolset/tool/extra');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('tool/extra');
+    });
+
+    it('should preserve leading slash in tool name', () => {
+      const result = parseToolId('http-69e20f48dbec7c6ece77556b//test');
+      expect(result.parentId).toBe('69e20f48dbec7c6ece77556b');
+      expect(result.toolName).toBe('/test');
+    });
+
+    it('should handle empty tool name', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011/');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('');
+    });
+
+    it('should handle empty toolset and tool name in old format', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011//');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('/');
+    });
+  });
+
+  describe('向后兼容性', () => {
+    it('should correctly identify new format vs old format', () => {
+      // 新版格式: 只有两个部分(appId 和 toolName)
+      const newFormat = parseToolId('mcp-507f1f77bcf86cd799439011/tool');
+      expect(newFormat.toolName).toBe('tool');
+
+      // 旧版格式: 有三个部分(appId, toolsetName, toolName)
+      const oldFormat = parseToolId('mcp-507f1f77bcf86cd799439011/toolset/tool');
+      expect(oldFormat.toolName).toBe('tool');
+
+      // 两者的 toolName 应该相同
+      expect(newFormat.toolName).toBe(oldFormat.toolName);
+    });
+
+    it('should handle migration from old to new format', () => {
+      const oldId = 'mcp-507f1f77bcf86cd799439011/MyToolset/weatherAPI';
+      const newId = 'mcp-507f1f77bcf86cd799439011/weatherAPI';
+
+      const oldResult = parseToolId(oldId);
+      const newResult = parseToolId(newId);
+
+      expect(oldResult.parentId).toBe(newResult.parentId);
+      expect(oldResult.toolName).toBe(newResult.toolName);
+    });
+  });
+
+  describe('真实场景测试', () => {
+    it('should parse real MCP tool ID', () => {
+      const result = parseToolId('mcp-65f8a9b2c3d4e5f6a7b8c9d0/filesystem/readFile');
+      expect(result.parentId).toBe('65f8a9b2c3d4e5f6a7b8c9d0');
+      expect(result.toolName).toBe('readFile');
+    });
+
+    it('should parse real HTTP tool ID', () => {
+      const result = parseToolId('http-65f8a9b2c3d4e5f6a7b8c9d0/WeatherAPI');
+      expect(result.parentId).toBe('65f8a9b2c3d4e5f6a7b8c9d0');
+      expect(result.toolName).toBe('WeatherAPI');
+    });
+
+    it('should handle Chinese tool names', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011/天气查询');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('天气查询');
+    });
+
+    it('should handle tool names with spaces', () => {
+      const result = parseToolId('http-507f1f77bcf86cd799439011/Weather API');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBe('Weather API');
+    });
+  });
+
+  describe('性能测试', () => {
+    it('should parse tool IDs efficiently', () => {
+      const iterations = 10000;
+      const start = Date.now();
+
+      for (let i = 0; i < iterations; i++) {
+        parseToolId('mcp-507f1f77bcf86cd799439011/toolset/tool');
+      }
+
+      const duration = Date.now() - start;
+      console.log(`Parsed ${iterations} tool IDs in ${duration}ms`);
+
+      // 性能检查: 10000 次解析应该在 100ms 内完成
+      expect(duration).toBeLessThan(100);
+    });
+
+    it('should handle batch parsing', () => {
+      const toolIds = [
+        'mcp-507f1f77bcf86cd799439011/tool1',
+        'http-507f1f77bcf86cd799439011/tool2',
+        'mcp-507f1f77bcf86cd799439011/toolset/tool3',
+        'http-507f1f77bcf86cd799439011/toolset/tool4'
+      ];
+
+      const results = toolIds.map((id) => parseToolId(id));
+
+      expect(results).toHaveLength(4);
+      expect(results[0].toolName).toBe('tool1');
+      expect(results[1].toolName).toBe('tool2');
+      expect(results[2].toolName).toBe('tool3');
+      expect(results[3].toolName).toBe('tool4');
+    });
+  });
+
+  describe('错误处理', () => {
+    it('should handle missing slash', () => {
+      const result = parseToolId('mcp-507f1f77bcf86cd799439011');
+      expect(result.parentId).toBe('507f1f77bcf86cd799439011');
+      expect(result.toolName).toBeUndefined();
+    });
+
+    it('should handle only source prefix', () => {
+      const result = parseToolId('mcp-');
+      expect(result.parentId).toBe('');
+      expect(result.toolName).toBeUndefined();
+    });
+
+    it('should handle malformed ID gracefully', () => {
+      // 虽然这些是无效的 ID,但函数应该不会崩溃
+      expect(() => parseToolId('invalid')).not.toThrow();
+      expect(() => parseToolId('')).not.toThrow();
+      expect(() => parseToolId('/')).not.toThrow();
+    });
+  });
+});

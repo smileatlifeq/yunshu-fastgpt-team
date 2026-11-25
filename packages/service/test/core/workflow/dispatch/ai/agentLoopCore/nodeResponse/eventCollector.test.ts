@@ -1,0 +1,285 @@
+import { FlowNodeTypeEnum } from '@fastgpt/global/core/workflow/node/constant';
+import { UserConfigError } from '@fastgpt/global/common/error/utils';
+import { createAgentLoopCoreNodeResponseEventCollector } from '@fastgpt/service/core/workflow/dispatch/ai/agentLoopCore/adapter/nodeResponse/eventCollector';
+import { describe, expect, it } from 'vitest';
+
+const toolCall = ({ id, name, args = '{}' }: { id: string; name: string; args?: string }) =>
+  ({
+    id,
+    type: 'function',
+    function: {
+      name,
+      arguments: args
+    }
+  }) as const;
+
+const createCollector = () => {
+  const nodeResponses: any[] = [];
+  const collector = createAgentLoopCoreNodeResponseEventCollector({
+    node: {
+      nodeId: 'agent_node',
+      flowNodeType: FlowNodeTypeEnum.agent
+    },
+    nodeResponses,
+    getToolInfo: (name) => ({
+      name: name === 'search' ? 'Search' : name,
+      avatar: 'tool-avatar'
+    })
+  });
+
+  return {
+    collector,
+    nodeResponses
+  };
+};
+
+describe('createAgentLoopCoreNodeResponseEventCollector', () => {
+  it('records main agent request node responses', () => {
+    const { collector, nodeResponses } = createCollector();
+
+    const event = {
+      type: 'llm_request_end',
+      requestIndex: 1,
+      modelName: 'GPT-4',
+      requestId: 'req_1',
+      finishReason: 'stop',
+      answerText: 'answer',
+      reasoningText: 'reason',
+      usages: [
+        {
+          modelId: '507f1f77bcf86cd799439011',
+          inputTokens: 10,
+          outputTokens: 5,
+          totalPoints: 1
+        }
+      ],
+      seconds: 0.2
+    } as const;
+    collector.emitEvent(event);
+    collector.emitEvent(event);
+
+    expect(nodeResponses).toEqual([
+      expect.objectContaining({
+        id: 'agent_node-1-req_1',
+        nodeId: 'agent_node-main_agent-1',
+        moduleName: 'chat:master_agent_call',
+        moduleType: FlowNodeTypeEnum.agent,
+        modelId: '507f1f77bcf86cd799439011',
+        model: 'GPT-4',
+        llmRequestIds: ['req_1'],
+        inputTokens: 10,
+        outputTokens: 5,
+        totalPoints: 1,
+        finishReason: 'stop',
+        textOutput: 'answer',
+        reasoningText: 'reason',
+        runningTime: 0.2
+      })
+    ]);
+  });
+
+  it('stores only display text for failed LLM responses', () => {
+    const { collector, nodeResponses } = createCollector();
+
+    collector.emitEvent({
+      type: 'llm_request_end',
+      requestIndex: 1,
+      modelName: 'GPT-4',
+      requestId: 'req_config_error',
+      finishReason: 'error',
+      error: new UserConfigError('Invalid API key'),
+      usages: [],
+      seconds: 0.2
+    } as any);
+
+    expect(nodeResponses).toEqual([
+      expect.objectContaining({
+        errorText: 'Invalid API key'
+      })
+    ]);
+
+    expect(nodeResponses[0]).not.toHaveProperty('error');
+  });
+
+  it('records tool responses and compression as separate flat rows', () => {
+    const { collector, nodeResponses } = createCollector();
+
+    collector.cacheToolResult({
+      callId: 'call_search',
+      usages: [
+        {
+          totalPoints: 2
+        }
+      ],
+      nodeResponse: {
+        id: 'call_search',
+        nodeId: 'call_search',
+        moduleType: FlowNodeTypeEnum.tool,
+        moduleName: 'Search'
+      } as any
+    });
+    collector.emitEvent({
+      type: 'tool_run_end',
+      call: toolCall({
+        id: 'call_search',
+        name: 'search'
+      }),
+      response: 'compressed',
+      seconds: 0.5,
+      toolResponseCompress: {
+        response: 'compressed',
+        modelName: 'GPT-4',
+        usage: {
+          modelId: '507f1f77bcf86cd799439011',
+          inputTokens: 8,
+          outputTokens: 2,
+          totalPoints: 0.3
+        },
+        requestIds: ['req_compress'],
+        seconds: 0.1
+      }
+    });
+
+    expect(nodeResponses).toEqual([
+      expect.objectContaining({
+        id: 'call_search',
+        moduleName: 'Search',
+        runningTime: 0.5,
+        toolRes: 'compressed',
+        totalPoints: 2
+      }),
+      expect.objectContaining({
+        id: 'req_compress',
+        moduleName: 'chat:tool_response_compress',
+        parentId: 'call_search',
+        totalPoints: 0.3,
+        textOutput: 'compressed'
+      })
+    ]);
+  });
+
+  it('records failed tools with their response, error and usage', () => {
+    const { collector, nodeResponses } = createCollector();
+    const call = toolCall({
+      id: 'call_failed',
+      name: 'search',
+      args: '{"q":"FastGPT"}'
+    });
+
+    collector.cacheToolResult({
+      callId: call.id,
+      usages: [{ moduleName: 'Search', totalPoints: 2 }]
+    });
+    collector.emitEvent({
+      type: 'tool_run_end',
+      call,
+      response: 'search unavailable',
+      errorMessage: 'search unavailable',
+      seconds: 0.4
+    });
+
+    expect(nodeResponses).toEqual([
+      expect.objectContaining({
+        id: 'call_failed',
+        moduleName: 'Search',
+        toolInput: { q: 'FastGPT' },
+        toolRes: 'search unavailable',
+        errorText: 'search unavailable',
+        totalPoints: 2
+      })
+    ]);
+  });
+
+  it('deduplicates context compression responses by checkpoint without request ids', () => {
+    const { collector, nodeResponses } = createCollector();
+    const event = {
+      type: 'after_message_compress',
+      modelName: 'GPT-4',
+      usages: [
+        {
+          moduleName: 'account_usage:compress_llm_messages',
+          totalPoints: 0.2
+        }
+      ],
+      requestIds: [],
+      seconds: 0.1,
+      contextCheckpoint: '<context_checkpoint>same</context_checkpoint>'
+    } as const;
+
+    collector.emitEvent(event);
+    collector.emitEvent({ ...event, seconds: 0.2 });
+
+    expect(nodeResponses).toHaveLength(1);
+  });
+
+  it('records plan and ask control node responses once', () => {
+    const { collector, nodeResponses } = createCollector();
+
+    collector.emitEvent({
+      type: 'plan_operation',
+      operation: 'set_plan',
+      success: true,
+      message: 'plan created',
+      id: 'call_plan',
+      seconds: 0.2,
+      plan: {
+        planId: 'plan_1',
+        name: 'Implementation plan',
+        description: null,
+        steps: [{ id: 'step_1', name: 'Implement plan events', status: 'pending' }]
+      }
+    });
+    collector.emitEvent({
+      type: 'plan_operation',
+      operation: 'set_plan',
+      success: true,
+      message: 'plan created again',
+      id: 'call_plan',
+      seconds: 0.3,
+      plan: {
+        planId: 'plan_1',
+        name: 'Implementation plan',
+        description: null,
+        steps: [{ id: 'step_1', name: 'Implement plan events', status: 'pending' }]
+      }
+    });
+    const argumentsText = JSON.stringify({
+      reason: 'Need confirmation',
+      blockerType: 'user_choice',
+      questions: ['Confirm?', 'Include examples?'].map((question) => ({
+        question,
+        options: [
+          { summary: 'Yes', value: 'Yes' },
+          { summary: 'No', value: 'No' }
+        ]
+      }))
+    });
+    collector.emitEvent({
+      type: 'tool_interactive',
+      call: {
+        id: 'call_ask',
+        type: 'function',
+        function: { name: 'ask_user', arguments: argumentsText }
+      },
+      interactive: {
+        type: 'agentAsk',
+        params: { toolCallId: 'call_ask', arguments: argumentsText }
+      }
+    });
+
+    expect(nodeResponses).toEqual([
+      expect.objectContaining({
+        id: 'agent_node-plan-call_plan',
+        moduleName: 'chat:plan_update',
+        agentPlanResult: 'plan created',
+        agentPlanStatus: 'set_plan'
+      }),
+      expect.objectContaining({
+        id: 'agent_node-ask-call_ask',
+        moduleName: 'chat:collect_questions',
+        textOutput: 'Confirm?\nInclude examples?'
+      })
+    ]);
+    expect(nodeResponses[0].textOutput).toBeUndefined();
+  });
+});

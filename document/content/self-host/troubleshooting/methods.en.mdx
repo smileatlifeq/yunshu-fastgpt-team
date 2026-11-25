@@ -1,0 +1,21 @@
+---
+title: Troubleshooting Methods
+description: How to diagnose issues in a self-hosted FastGPT deployment
+---
+
+## 1. Troubleshooting Methods
+
+Search the [GitHub issues](https://github.com/labring/FastGPT/issues) for a similar problem, or open a new issue. Include the steps to reproduce the problem, relevant logs, and screenshots from your self-hosted deployment.
+
+### (1) Get Backend Errors
+
+1. Run `docker ps -a` to check the status of every container. For a container that has stopped or failed, run `docker logs container_name` to inspect its logs.
+2. For containers that are running, use the same log command to find errors from the affected service.
+
+---
+
+### (2) Frontend Errors
+
+If the page crashes and asks you to check the console, open your browser developer tools and select **Console**. Click the file link beside an error to inspect its source location. Include these error details when reporting the issue.
+
+---

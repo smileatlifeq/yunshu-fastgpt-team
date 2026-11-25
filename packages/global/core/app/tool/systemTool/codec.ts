@@ -1,0 +1,154 @@
+import type { SystemToolListItemType } from './type';
+import type { ToolListItemType as SDKToolListItemType } from '../../../../sdk/fastgpt-plugin';
+import type { SystemPluginToolCollectionType } from '../../../plugin/tool/type';
+import { PluginStatusEnum } from '../../../plugin/type';
+import { SystemToolSystemSecretStatusEnum } from './constants';
+import { isDebugToolSource } from '../utils';
+import { CompatibleSecretValueSchema, type SecretValueType } from '../../../../common/secret/type';
+import type { InputConfigType } from '../../../workflow/type/io';
+
+/**
+ * 将工具配置边界的旧标量和双字段值包装为凭据来源，前端和运行时共用。
+ * 密钥只接受字符串；数字和开关兼容旧字符串，非法对象不算已配置。
+ */
+export const normalizeToolInputValue = ({
+  value,
+  inputType
+}: {
+  value: unknown;
+  inputType: InputConfigType['inputType'];
+}): SecretValueType | { value: number | boolean } | undefined => {
+  const secretValue = CompatibleSecretValueSchema.safeParse(value);
+  const normalized = secretValue.success ? secretValue.data : { value };
+  if (!('value' in normalized)) return normalized;
+  const rawValue = normalized.value;
+  if (inputType === 'switch' && (rawValue === 'true' || rawValue === 'false')) {
+    return { value: rawValue === 'true' };
+  }
+  if (
+    inputType === 'numberInput' &&
+    typeof rawValue === 'string' &&
+    rawValue.trim() !== '' &&
+    Number.isFinite(Number(rawValue))
+  ) {
+    return { value: Number(rawValue) };
+  }
+  if (typeof rawValue === 'string') return { value: rawValue };
+  if (inputType !== 'secret' && (typeof rawValue === 'number' || typeof rawValue === 'boolean'))
+    return { value: rawValue };
+  return undefined;
+};
+
+type SystemToolConfigLike = SystemPluginToolCollectionType & {
+  toObject?: () => SystemPluginToolCollectionType;
+};
+
+export const SystemToolCodec = {
+  getDBPluginId: (pluginId: string) => `systemTool-${pluginId}`,
+  getPluginIdFromDB: (dbPluginId: string) => dbPluginId.replace(/^systemTool-/, ''),
+
+  getConfiguredSecretsVal(config?: SystemToolConfigLike | null) {
+    if (!config) return undefined;
+    const configData = typeof config.toObject === 'function' ? config.toObject() : config;
+
+    if (
+      Object.prototype.hasOwnProperty.call(configData, 'secretsVal') &&
+      configData.secretsVal !== undefined
+    ) {
+      return configData.secretsVal ?? undefined;
+    }
+
+    return configData.inputListVal;
+  },
+
+  getSystemSecretStatus({
+    hasSecret,
+    hasSystemSecret
+  }: {
+    hasSecret?: boolean;
+    hasSystemSecret?: boolean;
+  }) {
+    if (!hasSecret) return SystemToolSystemSecretStatusEnum.none;
+    return hasSystemSecret
+      ? SystemToolSystemSecretStatusEnum.configured
+      : SystemToolSystemSecretStatusEnum.unconfigured;
+  },
+
+  fromDBTypeToListItemType(item: SystemPluginToolCollectionType): SystemToolListItemType {
+    const { name, avatar, intro, version, userGuide, author = '', tags } = item.customConfig!;
+
+    return {
+      id: item.pluginId,
+      version,
+      status: item.status ?? PluginStatusEnum.Normal,
+      source: 'system',
+      author,
+      name,
+      avatar: avatar ?? '',
+      intro: intro ?? '',
+      tags: tags ?? [],
+      currentCost: item.currentCost ?? 0,
+      hasTokenFee: item.hasTokenFee ?? false,
+      pluginOrder: item.pluginOrder,
+      userGuide,
+      // 数据库内配置的 system tool 一定没有 system secret
+      hasSystemSecret: false,
+      systemSecretStatus: SystemToolSystemSecretStatusEnum.none,
+      systemKeyCost: 0,
+      // 数据库里面取出来的一定不是 toolset
+      isToolSet: false,
+      hideTags: item.hideTags ?? [],
+      promoteTags: item.promoteTags ?? []
+      // TODO: 不知道谁做落了，之后再补吧
+      // courseUrl: '',
+
+      // readmeURL 没有
+      // readmeUrl: ''
+    };
+  },
+
+  attachToolConfig({
+    tool,
+    config,
+    source
+  }: {
+    tool: SDKToolListItemType;
+    config?: SystemPluginToolCollectionType;
+    source?: string;
+  }): SystemToolListItemType {
+    const isDebugSource = isDebugToolSource(source) || isDebugToolSource(tool.source);
+    const configuredSecretsVal = isDebugSource ? undefined : this.getConfiguredSecretsVal(config);
+    const hasSystemSecret = !!configuredSecretsVal;
+    const systemTitle = (globalThis as typeof globalThis & { feConfigs?: { systemTitle?: string } })
+      .feConfigs?.systemTitle;
+
+    return {
+      id: this.getDBPluginId(tool.pluginId),
+      etag: tool.etag,
+      author: tool.author ?? systemTitle ?? '',
+      avatar: tool.icon,
+      currentCost: config?.currentCost ?? 0,
+      hasSystemSecret,
+      systemSecretStatus: this.getSystemSecretStatus({
+        hasSecret: tool.hasSecret,
+        hasSystemSecret
+      }),
+      hasTokenFee: config?.hasTokenFee ?? false,
+      intro: tool.description,
+      isToolSet: !!tool.children && tool.children.length > 0,
+      name: tool.name,
+      status: config?.status ?? PluginStatusEnum.Normal,
+      systemKeyCost: config?.systemKeyCost ?? 0,
+      tags: config?.customConfig?.tags ?? tool.tags ?? [],
+      version: tool.version,
+      courseUrl: tool.tutorialUrl,
+      hideTags: config?.hideTags ?? [],
+      promoteTags: config?.promoteTags ?? [],
+      pluginOrder: config?.pluginOrder ?? 0,
+      readmeUrl: tool.readmeUrl,
+      ...(tool.readmeUrls !== undefined ? { readmeUrls: tool.readmeUrls } : {}),
+      source: tool.source,
+      userGuide: config?.customConfig?.userGuide
+    };
+  }
+};

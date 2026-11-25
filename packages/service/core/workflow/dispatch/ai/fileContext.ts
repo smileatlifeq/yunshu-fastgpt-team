@@ -1,0 +1,147 @@
+import { ChatFileTypeEnum, ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
+import { chatValue2RuntimePrompt } from '@fastgpt/global/core/chat/adapt';
+import type { ChatItemMiniType, UserChatItemFileItemType } from '@fastgpt/global/core/chat/type';
+import { getSafeSandboxInputFilename } from '../../../ai/sandbox/utils';
+import { prepareWorkflowFiles } from '../../utils/context';
+import {
+  rewriteAgentLoopCoreUserMessageWithFiles,
+  type AgentLoopCoreInputFile,
+  type AgentLoopCoreUserReminderContext
+} from './agentLoopCore/interface';
+
+type ParseWorkflowAIInputFilesParams = {
+  files: UserChatItemFileItemType[];
+  maxFileAmount: number;
+};
+
+type BuildWorkflowAICurrentInputFilesParams = {
+  currentFiles?: string[];
+  currentQuery?: ChatItemMiniType['value'];
+  maxFileAmount: number;
+};
+
+type RewriteWorkflowAIUserMessageWithFilesParams = {
+  message: ChatItemMiniType;
+  maxFileAmount: number;
+  files?: AgentLoopCoreInputFile[];
+  query?: string;
+  reminderContext?: AgentLoopCoreUserReminderContext;
+  transformFiles?: (files: AgentLoopCoreInputFile[]) => AgentLoopCoreInputFile[];
+};
+
+type RewriteWorkflowAIHistoryMessageWithFilesParams = Pick<
+  RewriteWorkflowAIUserMessageWithFilesParams,
+  'message' | 'maxFileAmount' | 'transformFiles'
+> & {
+  parseHistoryFiles: boolean;
+};
+
+/**
+ * 将 Workflow AI 输入文件转换成可直接交给模型的 URL 文件描述。
+ *
+ * 已登记文件使用 WorkflowFileContext 提供的 modelUrl 和 identity；未登记外链仅接受绝对
+ * HTTP(S) URL。返回结果按 identity 去重、按请求上限截断，并统一清洗文件名。
+ */
+export const parseWorkflowAIInputFiles = async ({
+  files,
+  maxFileAmount
+}: ParseWorkflowAIInputFilesParams): Promise<AgentLoopCoreInputFile[]> => {
+  const parsedFiles = await prepareWorkflowFiles({
+    files,
+    maxFiles: maxFileAmount,
+    allowDataUrl: false
+  });
+
+  // 分类可以并发，但文件名必须按输入顺序分配，保持沙箱路径稳定。
+  const usedNames = new Map<string, number>();
+  return parsedFiles.map((file, index) => ({
+    name: getSafeSandboxInputFilename(file.name || file.url, index, usedNames),
+    ...(file.filename ? { filename: file.filename } : {}),
+    type: file.type,
+    url: file.url
+  }));
+};
+
+/** 合并 query 文件和节点文件输入，并使用统一的 Workflow Context 规则生成本轮文件列表。 */
+export const buildWorkflowAICurrentInputFiles = async ({
+  currentFiles = [],
+  currentQuery,
+  maxFileAmount
+}: BuildWorkflowAICurrentInputFilesParams): Promise<AgentLoopCoreInputFile[]> => {
+  const { files: queryFiles = [] } = currentQuery
+    ? chatValue2RuntimePrompt(currentQuery)
+    : { files: [] };
+  const inputUrls = [...queryFiles.map((file) => file.url), ...currentFiles].filter(
+    (url, index, list) => url && list.indexOf(url) === index
+  );
+  const queryFilesByUrl = new Map(queryFiles.map((file) => [file.url, file]));
+
+  return await parseWorkflowAIInputFiles({
+    files: inputUrls.map(
+      (url) => queryFilesByUrl.get(url) || { type: ChatFileTypeEnum.unknown, url }
+    ),
+    maxFileAmount
+  });
+};
+
+/**
+ * Agent 与 ToolCall 共用的 Workflow 文件 query 改写入口。
+ *
+ * 外层先完成 Context URL 解析和可选 Sandbox 路径补充，再交给纯 AgentLoop 消息逻辑完成
+ * 文档 reminder 与多模态消息分流。
+ */
+export const rewriteWorkflowAIUserMessageWithFiles = async ({
+  message,
+  maxFileAmount,
+  files: inputFiles,
+  query,
+  reminderContext,
+  transformFiles
+}: RewriteWorkflowAIUserMessageWithFilesParams) => {
+  const { files: messageFiles = [] } = chatValue2RuntimePrompt(message.value);
+  const parsedFiles =
+    inputFiles ?? (await parseWorkflowAIInputFiles({ files: messageFiles, maxFileAmount }));
+  const files = transformFiles?.(parsedFiles) ?? parsedFiles;
+
+  return {
+    files,
+    message: rewriteAgentLoopCoreUserMessageWithFiles({
+      message,
+      files,
+      query,
+      reminderContext
+    })
+  };
+};
+
+/**
+ * 按节点文件输入绑定状态改写历史消息。
+ *
+ * 未启用历史文件时移除 Human 消息中的全部文件项；启用时复用当前消息的文件归一化、
+ * 去重和文档/多模态分流规则。非 Human 消息保持原样。
+ */
+export const rewriteWorkflowAIHistoryMessageWithFiles = async ({
+  message,
+  maxFileAmount,
+  parseHistoryFiles,
+  transformFiles
+}: RewriteWorkflowAIHistoryMessageWithFilesParams) => {
+  if (message.obj !== ChatRoleEnum.Human) {
+    return { message, files: [] };
+  }
+  if (!parseHistoryFiles) {
+    return {
+      message: {
+        ...message,
+        value: message.value.filter((item) => !item.file)
+      },
+      files: []
+    };
+  }
+
+  return await rewriteWorkflowAIUserMessageWithFiles({
+    message,
+    maxFileAmount,
+    transformFiles
+  });
+};

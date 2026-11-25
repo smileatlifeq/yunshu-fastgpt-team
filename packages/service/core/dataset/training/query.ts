@@ -1,0 +1,265 @@
+import {
+  CollectionTrainingStatusEnum,
+  TrainingModeEnum
+} from '@fastgpt/global/core/dataset/constants';
+import type {
+  CollectionTrainingStatusType,
+  DatasetTrainingSchemaType
+} from '@fastgpt/global/core/dataset/type';
+import type { PipelineStage } from 'mongoose';
+import type { DatasetDataRebuildStatusCounts } from '../data/query';
+
+type TrainingStatusCount = {
+  activeCount: number;
+  finalErrorCount: number;
+};
+
+export type CollectionTrainingModeCount = TrainingStatusCount & {
+  mode: TrainingModeEnum;
+};
+
+export const BLOCKED_LOCK_TIME = new Date('2050-01-01');
+
+export const trainingModeRankMap: Record<TrainingModeEnum, number> = {
+  // 仅供迁移前的旧记录查询排序，不恢复 chunk 的生产或消费。
+  [TrainingModeEnum.chunk]: 5,
+  [TrainingModeEnum.parse]: 0,
+  [TrainingModeEnum.imageParse]: 1,
+  [TrainingModeEnum.qa]: 2,
+  [TrainingModeEnum.image]: 3,
+  [TrainingModeEnum.auto]: 4,
+  [TrainingModeEnum.rebuildIndex]: 5,
+  [TrainingModeEnum.rebuildSynonym]: 5,
+  [TrainingModeEnum.index]: 5
+};
+
+export const trainingModeRanks = Object.values(TrainingModeEnum).map((mode) => ({
+  mode,
+  rank: trainingModeRankMap[mode]
+}));
+
+const trimmedErrorMsgExpr = (fieldPath = '$errorMsg') => ({
+  $trim: {
+    input: {
+      $ifNull: [fieldPath, '']
+    }
+  }
+});
+
+/**
+ * 判断训练记录是否有有效错误信息。空字符串和纯空白字符串都视为无错误，
+ * 避免自动重试或历史脏数据被错误计入最终异常。
+ */
+export const hasEffectiveErrorMsg = (training?: Pick<DatasetTrainingSchemaType, 'errorMsg'>) => {
+  return typeof training?.errorMsg === 'string' && training.errorMsg.trim() !== '';
+};
+
+/**
+ * active 表示仍可能被训练队列继续处理的剩余任务，包含普通排队/训练中和自动重试中。
+ * 这里不判断 lockTime 是否已经到达队列可消费时间，只判断未被永久锁定。
+ */
+export const isActiveTraining = (
+  training?: Pick<DatasetTrainingSchemaType, 'retryCount' | 'lockTime'>
+) => {
+  return (training?.retryCount ?? 0) > 0 && new Date(training?.lockTime ?? 0) < BLOCKED_LOCK_TIME;
+};
+
+export const isTemporarilyFailedTraining = (
+  training?: Pick<DatasetTrainingSchemaType, 'retryCount' | 'lockTime' | 'errorMsg'>
+) => {
+  return hasEffectiveErrorMsg(training) && isActiveTraining(training);
+};
+
+export const isFinalErrorTraining = (
+  training?: Pick<DatasetTrainingSchemaType, 'retryCount' | 'lockTime' | 'errorMsg'>
+) => {
+  return (
+    hasEffectiveErrorMsg(training) &&
+    ((training?.retryCount ?? 0) <= 0 || new Date(training?.lockTime ?? 0) >= BLOCKED_LOCK_TIME)
+  );
+};
+
+export const isRemainingTraining = (
+  training?: Pick<DatasetTrainingSchemaType, 'retryCount' | 'lockTime' | 'errorMsg'>
+) => {
+  return isActiveTraining(training) || isFinalErrorTraining(training);
+};
+
+export const hasEffectiveErrorMsgExpr = { $gt: [{ $strLenCP: trimmedErrorMsgExpr() }, 0] };
+export const activeTrainingExpr = {
+  $and: [{ $gt: ['$retryCount', 0] }, { $lt: ['$lockTime', BLOCKED_LOCK_TIME] }]
+};
+export const finalErrorTrainingExpr = {
+  $and: [
+    hasEffectiveErrorMsgExpr,
+    {
+      $or: [{ $lte: ['$retryCount', 0] }, { $gte: ['$lockTime', BLOCKED_LOCK_TIME] }]
+    }
+  ]
+};
+export const remainingTrainingExpr = {
+  $or: [activeTrainingExpr, finalErrorTrainingExpr]
+};
+
+export const hasEffectiveErrorMsgMatch = {
+  $expr: hasEffectiveErrorMsgExpr
+};
+export const activeTrainingMatch = {
+  retryCount: { $gt: 0 },
+  lockTime: { $lt: BLOCKED_LOCK_TIME }
+};
+export const finalErrorTrainingMatch = {
+  $expr: finalErrorTrainingExpr
+};
+export const remainingTrainingMatch = {
+  $or: [activeTrainingMatch, finalErrorTrainingMatch]
+};
+
+/**
+ * 列表与详情共用的普通训练统计：直接按集合/阶段计数，再收敛为每个集合的阶段列表。
+ * 两类重建以 data 为权威来源，必须在这里排除；数量与最慢阶段统一由业务函数计算。
+ * 不累积逐条 training 数组，避免随后 unwind、排序和重复汇总。
+ */
+export const getCollectionTrainingModeCountsPipeline = (
+  match: Record<string, unknown>
+): PipelineStage[] => [
+  {
+    $match: {
+      ...match,
+      ...remainingTrainingMatch,
+      mode: { $nin: [TrainingModeEnum.rebuildIndex, TrainingModeEnum.rebuildSynonym] }
+    }
+  },
+  {
+    $group: {
+      _id: { collectionId: '$collectionId', mode: '$mode' },
+      activeCount: { $sum: { $cond: [activeTrainingExpr, 1, 0] } },
+      finalErrorCount: { $sum: { $cond: [finalErrorTrainingExpr, 1, 0] } }
+    }
+  },
+  {
+    $group: {
+      _id: '$_id.collectionId',
+      modeCounts: {
+        $push: {
+          mode: '$_id.mode',
+          activeCount: '$activeCount',
+          finalErrorCount: '$finalErrorCount'
+        }
+      }
+    }
+  }
+];
+
+/**
+ * rank 越小表示流程越早；collection 的“最慢阶段”就是剩余任务里流程最早的阶段。
+ */
+export const getTrainingModeRank = (mode?: TrainingModeEnum) => {
+  if (!mode) return Number.MAX_SAFE_INTEGER;
+  return trainingModeRankMap[mode] ?? Number.MAX_SAFE_INTEGER;
+};
+
+/**
+ * 返回流程中更早的训练阶段，用于计算用户感知上的“最慢阶段”。
+ */
+export const compareTrainingModeBySlowest = (a?: TrainingModeEnum, b?: TrainingModeEnum) => {
+  return getTrainingModeRank(a) - getTrainingModeRank(b);
+};
+
+export const getSlowestTrainingMode = (modes: Array<TrainingModeEnum | undefined>) => {
+  return modes.filter(Boolean).sort((a, b) => compareTrainingModeBySlowest(a, b))[0] as
+    | TrainingModeEnum
+    | undefined;
+};
+
+/**
+ * 根据各阶段 active/final error 数量计算 collection 级最慢阶段状态。
+ * 最慢阶段只有最终异常时才展示 error。
+ */
+export const getSlowestTrainingStatus = (
+  modeCounts: Partial<Record<TrainingModeEnum, TrainingStatusCount>>
+) => {
+  const slowestTrainingMode = getSlowestTrainingMode(
+    Object.entries(modeCounts)
+      .filter(([, count]) => (count?.activeCount ?? 0) + (count?.finalErrorCount ?? 0) > 0)
+      .map(([mode]) => mode as TrainingModeEnum)
+  );
+
+  if (!slowestTrainingMode) {
+    return {
+      slowestTrainingStatus: CollectionTrainingStatusEnum.ready
+    };
+  }
+
+  const slowestCounts = modeCounts[slowestTrainingMode];
+  return {
+    slowestTrainingMode,
+    slowestTrainingStatus:
+      (slowestCounts?.activeCount ?? 0) > 0
+        ? CollectionTrainingStatusEnum.running
+        : CollectionTrainingStatusEnum.error
+  };
+};
+
+/**
+ * 合并普通训练阶段与 data 的重建状态，统一集合列表和详情的数量及最慢阶段。
+ * 重建以 data 为唯一统计来源；覆盖 training 的 rebuild 数量，避免排队、执行或残留任务重复计数。
+ */
+export const getCollectionTrainingStatusByMode = ({
+  modeCounts,
+  rebuildIndexCounts = { activeCount: 0, finalErrorCount: 0 },
+  rebuildSynonymCounts = { activeCount: 0, finalErrorCount: 0 }
+}: {
+  modeCounts: Partial<Record<TrainingModeEnum, TrainingStatusCount>>;
+  rebuildIndexCounts?: TrainingStatusCount;
+  rebuildSynonymCounts?: TrainingStatusCount;
+}): CollectionTrainingStatusType => {
+  const counts = {
+    ...modeCounts,
+    [TrainingModeEnum.rebuildIndex]: rebuildIndexCounts,
+    [TrainingModeEnum.rebuildSynonym]: rebuildSynonymCounts
+  };
+  const activeTrainingAmount = Object.values(counts).reduce(
+    (sum, count) => sum + (count?.activeCount ?? 0),
+    0
+  );
+  const finalErrorAmount = Object.values(counts).reduce(
+    (sum, count) => sum + (count?.finalErrorCount ?? 0),
+    0
+  );
+  return {
+    trainingAmount: activeTrainingAmount + finalErrorAmount,
+    activeTrainingAmount,
+    finalErrorAmount,
+    hasError: finalErrorAmount > 0,
+    ...getSlowestTrainingStatus(counts)
+  };
+};
+
+/**
+ * 将普通训练的阶段聚合结果与 data 重建计数转换为集合状态。
+ * 缺少聚合记录时按零计数，供列表、详情统一处理空集合和仅有重建任务的集合。
+ */
+export const getCollectionTrainingStatusFromCounts = ({
+  modeCounts = [],
+  rebuildCounts
+}: {
+  modeCounts?: CollectionTrainingModeCount[];
+  rebuildCounts?: DatasetDataRebuildStatusCounts;
+}): CollectionTrainingStatusType =>
+  getCollectionTrainingStatusByMode({
+    modeCounts: Object.fromEntries(
+      modeCounts.map(({ mode, activeCount, finalErrorCount }) => [
+        mode,
+        { activeCount, finalErrorCount }
+      ])
+    ),
+    rebuildIndexCounts: {
+      activeCount: rebuildCounts?.rebuildIndexActiveCount ?? 0,
+      finalErrorCount: rebuildCounts?.rebuildIndexFailedCount ?? 0
+    },
+    rebuildSynonymCounts: {
+      activeCount: rebuildCounts?.rebuildSynonymActiveCount ?? 0,
+      finalErrorCount: rebuildCounts?.rebuildSynonymFailedCount ?? 0
+    }
+  });

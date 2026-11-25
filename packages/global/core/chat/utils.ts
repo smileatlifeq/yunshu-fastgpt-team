@@ -1,0 +1,377 @@
+import { type DispatchNodeResponseType } from '../workflow/runtime/type';
+import { FlowNodeTypeEnum } from '../workflow/node/constant';
+import { ChatRoleEnum, ChatSourceEnum } from './constants';
+import {
+  type AIChatItemValueItemType,
+  type ChatHistoryItemResType,
+  type ChatItemMiniType,
+  type UserChatItemValueItemType
+} from './type';
+import { sliceStrStartEnd } from '../../common/string/tools';
+import { PublishChannelEnum } from '../../support/outLink/constant';
+import { removeDatasetCiteText } from '../ai/llm/utils';
+import type { WorkflowInteractiveResponseType } from '../workflow/template/system/interactive/type';
+import { isAskInteractive, extractDeepestInteractive } from '../workflow/runtime/utils';
+import { childrenResponseFields, getChildrenResponses } from './utils/mergeNode';
+import { getUserChatSelect } from './input/utils';
+
+/**
+ * 合并两段历史，并把 system 消息排到最前。
+ *
+ * 比较函数必须同时看 a、b：只看 a 时两条 system 消息互相都「更小」，排序结果依赖引擎实现，
+ * 多条 system 会被倒序。按「是否 system」比较后依赖 sort 的稳定性，各组内部保持原顺序。
+ */
+export const concatHistories = (histories1: ChatItemMiniType[], histories2: ChatItemMiniType[]) => {
+  const newHistories = [...histories1, ...histories2];
+  const rolePriority = (item: ChatItemMiniType) => (item.obj === ChatRoleEnum.System ? 0 : 1);
+  return newHistories.sort((a, b) => rolePriority(a) - rolePriority(b));
+};
+
+export const hasContextCheckpoint = (history: ChatItemMiniType) =>
+  history.obj === ChatRoleEnum.AI &&
+  history.value.some((value) => !value.displayOnly && Boolean(value.contextCheckpoint));
+
+/**
+ * 判定当前节点响应是否属于供模型消费的工具执行详情。
+ *
+ * 模型发起的工具调用结果（无论成功或业务报错）会作为工具输出提交给上层大模型继续推理，
+ * 且已在消息内部的工具折叠卡片中展示，不应被提升为整轮对话或工作流的顶层失败错误。
+ *
+ * 新响应优先使用执行器记录的 isToolCall，区分画布直接执行和模型工具调用。
+ * 历史响应缺少该字段时沿用以下判定依据：
+ * 1. 显式工具节点类型（FlowNodeTypeEnum.tool / toolSet）；
+ * 2. 具备 Function Calling 调用与消费特征：
+ *    - 绑定了 Agent 调度的 toolId；
+ *    - 或产生并挂载了供大模型继续推理消费的 toolRes（子应用工具、自定义工具、系统工具在被调用时均会生成 toolRes）。
+ */
+export const isToolExecutionResponse = (item: ChatHistoryItemResType): boolean => {
+  if (item.isToolCall !== undefined) return item.isToolCall;
+
+  if (item.moduleType === FlowNodeTypeEnum.tool || item.moduleType === FlowNodeTypeEnum.toolSet) {
+    return true;
+  }
+
+  if (item.toolRes !== undefined || Boolean(item.toolId)) {
+    return true;
+  }
+
+  return false;
+};
+
+/**
+ * 从节点响应列表中定位导致会话、Agent 或工作流失败的目标错误节点。
+ *
+ * 前后端在处理顶层失败错误时统一遵循该逻辑：
+ * 1. 忽略被错误捕获分支（catchError）正常捕获的节点（errorCaptured === true）；
+ * 2. 忽略工具执行节点（isToolExecutionResponse === true），因为工具报错会由大模型继续推理消化；
+ * 3. 优先取顶层根节点错误（!item.parentId），保持容器封装与层级边界；
+ * 4. 若无根节点错误，但存在未正常挂载到父级的错误节点（例如容器执行异常中断导致孤儿节点），
+ *    允许从后往前提取作为兜底，避免流程崩溃时静默吞错。
+ */
+export const findFailedResponseNode = (
+  responseData: ChatHistoryItemResType[] = []
+): ChatHistoryItemResType | undefined => {
+  const isCandidate = (item: ChatHistoryItemResType) =>
+    !item.errorCaptured && !isToolExecutionResponse(item) && Boolean(item.error || item.errorText);
+
+  // 1. 优先匹配根节点（!item.parentId）
+  const rootErrorNode = responseData.findLast((item) => !item.parentId && isCandidate(item));
+  if (rootErrorNode) return rootErrorNode;
+
+  // 2. 孤儿节点兜底：仅当节点的父级未被记录（如父容器崩溃未生成自身 nodeResponse）时，才作为未挂载异常兜底暴露
+  const nodeIds = new Set(responseData.map((item) => item.id).filter(Boolean));
+  return responseData.findLast(
+    (item) => isCandidate(item) && Boolean(item.parentId && !nodeIds.has(item.parentId))
+  );
+};
+
+// Keep the first n and last n characters
+export const getHistoryPreview = (
+  completeMessages: ChatItemMiniType[],
+  size = 100,
+  useVision = false
+): {
+  obj: ChatRoleEnum;
+  value: string;
+}[] => {
+  return completeMessages.map((item, i) => {
+    const n =
+      (item.obj === ChatRoleEnum.System && i === 0) || i >= completeMessages.length - 2 ? size : 50;
+
+    // Get message text content
+    const rawText = (() => {
+      if (item.obj === ChatRoleEnum.System) {
+        return item.value?.map((item) => item.text?.content).join('') || '';
+      } else if (item.obj === ChatRoleEnum.Human) {
+        return (
+          item.value
+            ?.map((item) => {
+              if (item?.text?.content) return item?.text?.content;
+              if (item.file?.type === 'image' && useVision)
+                return `![Input an image](${item.file.url.slice(0, 100)}...)`;
+              return '';
+            })
+            .join('\n') || ''
+        );
+      } else if (item.obj === ChatRoleEnum.AI) {
+        return (
+          item.value
+            ?.map((item) => {
+              return (
+                item.text?.content ||
+                item.tool?.toolName ||
+                item?.tools?.map((item) => item.toolName).join(',') ||
+                ''
+              );
+            })
+            .join('')
+            .trim() || ''
+        );
+      }
+      return '';
+    })();
+
+    return {
+      obj: item.obj,
+      value: sliceStrStartEnd(rawText, n, n)
+    };
+  });
+};
+
+const publicNodeMap: Record<string, boolean> = {
+  [FlowNodeTypeEnum.appModule]: true,
+  [FlowNodeTypeEnum.pluginModule]: true,
+  [FlowNodeTypeEnum.datasetSearchNode]: true,
+  [FlowNodeTypeEnum.agent]: true,
+  [FlowNodeTypeEnum.pluginOutput]: true,
+  [FlowNodeTypeEnum.runApp]: true,
+  [FlowNodeTypeEnum.toolCall]: true,
+  [FlowNodeTypeEnum.tool]: true
+};
+
+const publicNodeResponseFields: Record<string, boolean> = {
+  pluginOutput: true,
+  runningTime: true,
+  toolId: true
+};
+
+const treeNodeResponseFields: Record<string, boolean> = {
+  ...publicNodeResponseFields,
+  parentId: true,
+  moduleNameArgs: true,
+  totalPoints: true,
+  childResponseCount: true,
+  isToolCall: true,
+  errorCaptured: true,
+  errorText: true
+};
+
+const getNodeResponseFieldMap = ({
+  responseDetail,
+  keepTreeFields
+}: {
+  responseDetail: boolean;
+  keepTreeFields: boolean;
+}) => {
+  const fields = keepTreeFields ? treeNodeResponseFields : publicNodeResponseFields;
+
+  return responseDetail
+    ? {
+        quoteList: true,
+        retrievalResults: true,
+        ...fields
+      }
+    : fields;
+};
+
+const filterNodeResponseData = ({
+  nodeResponses = [],
+  responseDetail = false,
+  keepTreeFields = false
+}: {
+  nodeResponses?: ChatHistoryItemResType[];
+  responseDetail?: boolean;
+  keepTreeFields?: boolean;
+}) => {
+  const fieldMap = getNodeResponseFieldMap({ responseDetail, keepTreeFields });
+
+  return nodeResponses
+    .filter((item) => publicNodeMap[item.moduleType])
+    .map((item) => {
+      const obj: DispatchNodeResponseType = {};
+      for (const key in item) {
+        const childField = key as (typeof childrenResponseFields)[number];
+        if (childrenResponseFields.includes(childField)) {
+          const childResponses = item[childField] as ChatHistoryItemResType[] | undefined;
+          obj[childField] = filterNodeResponseData({
+            nodeResponses: childResponses,
+            responseDetail,
+            keepTreeFields
+          });
+        } else if (fieldMap[key]) {
+          (obj as Record<string, unknown>)[key] = item[key as keyof ChatHistoryItemResType];
+        }
+      }
+
+      if (keepTreeFields) {
+        return {
+          id: item.id,
+          nodeId: item.nodeId,
+          moduleName: item.moduleName,
+          moduleType: item.moduleType,
+          ...obj
+        } as ChatHistoryItemResType;
+      }
+
+      return {
+        moduleType: item.moduleType,
+        ...obj
+      } as ChatHistoryItemResType;
+    });
+};
+
+/**
+ * 过滤工作流节点对外可见的响应字段。
+ *
+ * 公共 API 和分享场景不应直接暴露完整 nodeResponse，只保留旧契约中的展示字段。
+ * childrenResponses 与历史 detail 字段会递归过滤，保证新旧数据结构返回口径一致。
+ */
+export const filterPublicNodeResponseData = ({
+  nodeRespones = [],
+  responseDetail = false
+}: {
+  nodeRespones?: ChatHistoryItemResType[];
+  responseDetail?: boolean;
+}) =>
+  filterNodeResponseData({
+    nodeResponses: nodeRespones,
+    responseDetail
+  });
+
+/**
+ * 过滤前端树形详情需要的 nodeResponse 字段。
+ *
+ * 与 public/share 过滤不同，SSE 和 completion response 需要保留 `id/parentId` 等树形归属
+ * 字段，否则乱序 child 无法在前端挂回 parent；但仍过滤 toolInput/toolRes 等大字段或敏感字段。
+ */
+export const filterNodeResponseTreeData = ({
+  nodeResponses = [],
+  responseDetail = false
+}: {
+  nodeResponses?: ChatHistoryItemResType[];
+  responseDetail?: boolean;
+}) =>
+  filterNodeResponseData({
+    nodeResponses,
+    responseDetail,
+    keepTreeFields: true
+  });
+
+// Remove dataset cite in ai response
+export const removeAIResponseCite = <T extends AIChatItemValueItemType[] | string>(
+  value: T,
+  retainCite: boolean
+): T => {
+  if (retainCite) return value;
+
+  if (typeof value === 'string') {
+    return removeDatasetCiteText(value, false) as T;
+  }
+
+  return value.map<AIChatItemValueItemType>((item) => ({
+    ...item,
+    ...(item.text?.content
+      ? {
+          text: {
+            ...item.text,
+            content: removeDatasetCiteText(item.text.content, false)
+          }
+        }
+      : {}),
+    ...(item.reasoning?.content
+      ? {
+          reasoning: {
+            ...item.reasoning,
+            content: removeDatasetCiteText(item.reasoning.content, false)
+          }
+        }
+      : {})
+  })) as T;
+};
+
+export const removeEmptyUserInput = (input?: UserChatItemValueItemType[]) => {
+  return (
+    input?.filter((item) => {
+      // 全部跳过也是一次有效的结构化提交。
+      if (getUserChatSelect([item])) return true;
+      // 有文本内容，保留
+      if (item.text?.content?.trim()) {
+        return true;
+      }
+      // 有文件且文件有 key 或 url，保留
+      if (item.file && (item.file.key || item.file.url)) {
+        return true;
+      }
+      // 其他情况过滤掉
+      return false;
+    }) || []
+  );
+};
+
+export const getPluginOutputsFromChatResponses = (responses: ChatHistoryItemResType[]) => {
+  const outputs =
+    responses.find((item) => item.moduleType === FlowNodeTypeEnum.pluginOutput)?.pluginOutput ?? {};
+  return outputs;
+};
+
+/** 将发布渠道映射为聊天来源，企微 Webhook 与长连接共用现有企微统计来源。 */
+export const getChatSourceByPublishChannel = (publishChannel: PublishChannelEnum) => {
+  switch (publishChannel) {
+    case PublishChannelEnum.share:
+      return ChatSourceEnum.share;
+    case PublishChannelEnum.iframe:
+      return ChatSourceEnum.share;
+    case PublishChannelEnum.apikey:
+      return ChatSourceEnum.api;
+    case PublishChannelEnum.feishu:
+      return ChatSourceEnum.feishu;
+    case PublishChannelEnum.wecom:
+    case PublishChannelEnum.wecomWebsocket:
+      return ChatSourceEnum.wecom;
+    case PublishChannelEnum.wechat:
+      return ChatSourceEnum.wechat;
+    case PublishChannelEnum.officialAccount:
+      return ChatSourceEnum.official_account;
+    default:
+      return ChatSourceEnum.online;
+  }
+};
+
+/**
+ * 扁平化节点响应树。
+ *
+ * 新数据使用 childrenResponses，历史数据可能仍在 pluginDetail/toolDetail 等字段中；
+ * 统一通过 getChildrenResponses 递归展开，供统计、标签计算和详情搜索复用。
+ */
+export const getFlatAppResponses = (res: ChatHistoryItemResType[]): ChatHistoryItemResType[] => {
+  return res
+    .map((item) => {
+      return [item, ...getFlatAppResponses(getChildrenResponses(item))];
+    })
+    .flat();
+};
+
+/*
+  对于交互模式下，有两种响应：
+  1. 提交交互结果，此时不会新增一条 user 消息
+  2. 发送 user 消息，此时对话会新增一条 user 消息
+*/
+export const checkInteractiveResponseStatus = ({
+  interactive
+}: {
+  interactive: WorkflowInteractiveResponseType;
+  input: string;
+}): 'submit' | 'query' => {
+  const finalInteractive = extractDeepestInteractive(interactive);
+  return isAskInteractive(finalInteractive) ? 'query' : 'submit';
+};

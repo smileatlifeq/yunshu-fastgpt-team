@@ -1,0 +1,615 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { NodeInputKeyEnum } from '@fastgpt/global/core/workflow/constants';
+import { PluginStatusEnum } from '@fastgpt/global/core/plugin/type';
+import {
+  FlowNodeInputTypeEnum,
+  FlowNodeTypeEnum
+} from '@fastgpt/global/core/workflow/node/constant';
+
+const mocks = vi.hoisted(() => ({
+  getSystemToolDetail: vi.fn(),
+  getInstance: vi.fn(),
+  assertTeamPluginSourceAccess: vi.fn()
+}));
+
+vi.mock('@fastgpt/service/core/app/tool/systemTool/systemTool.repo', () => ({
+  SystemToolRepo: {
+    getInstance: mocks.getInstance
+  }
+}));
+
+vi.mock('@fastgpt/service/core/plugin/teamPluginPolicy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@fastgpt/service/core/plugin/teamPluginPolicy')>()),
+  assertTeamPluginSourceAccess: mocks.assertTeamPluginSourceAccess
+}));
+
+import { getClientSystemToolPreviewNode } from '@fastgpt/service/core/app/tool/utils/client';
+import { createWorkflowDocument } from '@fastgpt/workflow-core/src/domain/document';
+import { applyWorkflowCommand } from '@fastgpt/workflow-core/src/command/apply';
+import { createWorkflowTemplateBundleProvider } from '@fastgpt/workflow-core/src/template/provider';
+import { compileStoreWorkflow } from '@fastgpt/workflow-core/src/store/compile';
+import { formatToolInputSecrets } from '@fastgpt/service/core/app/tool/secretConfig';
+import { getSecretValue } from '@fastgpt/service/common/secret/utils';
+import { validateNodeIO } from '@fastgpt/workflow-core/src/validation/io';
+import type { WorkflowDiagnostic } from '@fastgpt/workflow-core/src/domain/diagnostic';
+
+describe('getClientSystemToolPreviewNode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getInstance.mockReturnValue({
+      getSystemToolDetail: mocks.getSystemToolDetail
+    });
+    mocks.assertTeamPluginSourceAccess.mockResolvedValue('teamId:team-1');
+  });
+
+  it('creates, configures, compiles and encrypts system tool authorization for runtime use', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-weather',
+      version: '1.0.0',
+      status: PluginStatusEnum.Normal,
+      source: 'system',
+      isToolSet: false,
+      avatar: 'weather.svg',
+      name: 'Weather',
+      intro: 'Weather query',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 1,
+      hasTokenFee: false,
+      hasSystemSecret: true,
+      secretSchema: {
+        type: 'object',
+        properties: {
+          apiKey: {
+            type: 'string',
+            title: 'API Key',
+            isSecret: true
+          }
+        },
+        required: ['apiKey']
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          city: {
+            type: 'string',
+            title: 'City'
+          }
+        }
+      }
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-weather',
+      versionId: '1.0.0',
+      lang: 'en'
+    });
+
+    expect(result.inputs[0]).toEqual({
+      key: NodeInputKeyEnum.systemInputConfig,
+      label: '',
+      renderTypeList: [FlowNodeInputTypeEnum.hidden],
+      selectedType: FlowNodeInputTypeEnum.hidden,
+      inputList: [
+        {
+          key: 'apiKey',
+          label: 'API Key',
+          inputType: 'secret',
+          description: undefined,
+          required: true
+        }
+      ]
+    });
+    expect(result.inputs[1]?.key).toBe('city');
+    expect(result.version).toBe('1.0.0');
+    expect(result.versionLabel).toBe('1.0.0');
+
+    const template = {
+      kind: 'systemTool' as const,
+      toolId: 'systemTool-weather',
+      source: 'system',
+      versionId: '1.0.0'
+    };
+    const dependencies = {
+      templateProvider: createWorkflowTemplateBundleProvider({
+        schemaVersion: 'fastgpt-workflow-template-bundle/v1',
+        items: [{ ref: template, template: result }]
+      })
+    };
+    const original = createWorkflowDocument();
+    const created = await applyWorkflowCommand({
+      document: original,
+      command: { type: 'node.add', template, nodeId: 'weather' },
+      dependencies
+    });
+    const configured = await applyWorkflowCommand({
+      document: created.document,
+      command: {
+        type: 'input.set',
+        nodeId: 'weather',
+        inputKey: NodeInputKeyEnum.systemInputConfig,
+        value: { type: 'manual', value: { apiKey: { value: 'test-only-api-key' } } }
+      },
+      dependencies
+    });
+    expect(created.document.nodes[0].inputs[0].value).toBeUndefined();
+    const { nodes } = compileStoreWorkflow(configured.document);
+    formatToolInputSecrets({ inputs: nodes[0].inputs, flowNodeType: nodes[0].flowNodeType });
+    const authorization = nodes[0].inputs[0].value;
+    expect(authorization.type).toBe('manual');
+    expect(authorization.value.apiKey.value).toBeUndefined();
+    expect(authorization.value.apiKey.secret).toBeTruthy();
+    expect(JSON.stringify(nodes)).not.toContain('test-only-api-key');
+    expect(getSecretValue({ storeSecret: authorization.value })).toEqual({
+      apiKey: 'test-only-api-key'
+    });
+
+    const encryptedBefore = structuredClone(authorization);
+    formatToolInputSecrets({ inputs: nodes[0].inputs, flowNodeType: nodes[0].flowNodeType });
+    expect(nodes[0].inputs[0].value).toEqual(encryptedBefore);
+    const diagnostics: WorkflowDiagnostic[] = [];
+    validateNodeIO({ document: configured.document, node: nodes[0], diagnostics });
+    expect(diagnostics).toEqual([]);
+  });
+
+  it('keeps inputs unchanged when system tool has no secrets', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-weather',
+      version: '1.0.0',
+      status: 1,
+      source: 'system',
+      isToolSet: false,
+      avatar: 'weather.svg',
+      name: 'Weather',
+      intro: 'Weather query',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          city: {
+            type: 'string',
+            title: 'City'
+          }
+        }
+      }
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-weather',
+      lang: 'en'
+    });
+
+    expect(result.inputs).toHaveLength(1);
+    expect(result.inputs[0]?.key).toBe('city');
+    expect(result.version).toBe('');
+    expect(result.versionLabel).toBeUndefined();
+  });
+
+  it('selects plugin metadata and x-i18n strings for the preview snapshot', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-search',
+      version: '1.0.0',
+      status: 1,
+      source: 'system',
+      isToolSet: true,
+      avatar: 'search.svg',
+      name: { en: 'Document search', 'zh-CN': '文档搜索' },
+      intro: { en: 'Search summary', 'zh-CN': '搜索简介' },
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false,
+      readmeUrl: 'https://example.com/legacy.md',
+      readmeUrls: {
+        en: 'https://example.com/en.md',
+        'zh-CN': 'https://example.com/zh.md'
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            'x-i18n': {
+              title: { en: 'Query', 'zh-CN': '查询' },
+              description: { en: 'Search text', 'zh-CN': '检索文本' },
+              placeholder: { en: 'Enter query', 'zh-CN': '输入查询' }
+            }
+          }
+        }
+      },
+      outputSchema: {
+        type: 'object',
+        properties: {
+          result: {
+            type: 'string',
+            'x-i18n': { title: { en: 'Result', 'zh-CN': '结果' } }
+          }
+        }
+      },
+      children: [
+        {
+          id: 'pages',
+          name: { en: 'Search pages', 'zh-CN': '搜索页面' },
+          description: { en: 'Search the page index', 'zh-CN': '搜索页面索引' },
+          inputSchema: { type: 'object', properties: {} },
+          outputSchema: { type: 'object', properties: {} }
+        }
+      ]
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-search',
+      lang: 'en'
+    });
+
+    expect(result).toMatchObject({
+      name: 'Document search',
+      intro: 'Search summary',
+      metadataLocale: 'en',
+      readmeUrl: 'https://example.com/en.md',
+      toolConfig: {
+        systemToolSet: {
+          toolList: [{ name: 'Search pages', description: 'Search the page index' }]
+        }
+      }
+    });
+    expect(result.inputs[0]).toMatchObject({
+      key: 'query',
+      label: 'Query',
+      description: 'Search text',
+      placeholder: 'Enter query'
+    });
+    expect(result.outputs[0]).toMatchObject({ id: 'result', label: 'Result' });
+  });
+
+  it('restores workflow tool input metadata before applying its default mode', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-workflow',
+      version: '1.0.0',
+      status: 1,
+      source: 'system',
+      isToolSet: false,
+      associatedPluginId: 'workflow-app',
+      avatar: 'workflow.svg',
+      name: 'Workflow tool',
+      intro: 'Workflow tool',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          count: {
+            type: 'number',
+            title: 'Count',
+            isToolParam: true,
+            'x-fastgpt-node-input': {
+              valueType: 'number',
+              renderTypeList: ['numberInput', 'reference'],
+              selectedType: 'numberInput'
+            }
+          }
+        }
+      }
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-workflow',
+      versionId: '1.0.0',
+      lang: 'en'
+    });
+
+    expect(result.inputs.find((item) => item.key === 'count')).toMatchObject({
+      valueType: 'number',
+      selectedType: FlowNodeInputTypeEnum.agentGenerated,
+      renderTypeList: [
+        FlowNodeInputTypeEnum.agentGenerated,
+        FlowNodeInputTypeEnum.numberInput,
+        'reference'
+      ],
+      defaultToAgentGenerated: true
+    });
+  });
+
+  it('projects workflow tool external variables to configurable parent inputs', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-workflow',
+      version: '1.0.0',
+      status: 1,
+      source: 'system',
+      isToolSet: false,
+      associatedPluginId: 'workflow-app',
+      avatar: 'workflow.svg',
+      name: 'Workflow tool',
+      intro: 'Workflow tool',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          externalVariable: {
+            type: 'string',
+            title: 'External variable',
+            default: 'fallback',
+            'x-fastgpt-node-input': {
+              valueType: 'string',
+              defaultValue: 'fallback',
+              renderTypeList: ['customVariable'],
+              selectedType: 'customVariable'
+            }
+          }
+        }
+      }
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-workflow',
+      versionId: '1.0.0',
+      lang: 'en'
+    });
+
+    const input = result.inputs.find((item) => item.key === 'externalVariable');
+    expect(input).toMatchObject({
+      valueType: 'string',
+      defaultValue: 'fallback',
+      canAgentGenerated: true,
+      defaultToAgentGenerated: true,
+      renderTypeList: [FlowNodeInputTypeEnum.agentGenerated, 'reference', 'input'],
+      selectedType: FlowNodeInputTypeEnum.agentGenerated
+    });
+  });
+
+  it('returns latest version id when requested explicitly', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-weather',
+      version: '1.0.0',
+      status: 1,
+      source: 'system',
+      isToolSet: false,
+      avatar: 'weather.svg',
+      name: 'Weather',
+      intro: 'Weather query',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-weather',
+      getLatestVersion: true,
+      lang: 'en'
+    });
+
+    expect(result.version).toBe('1.0.0');
+    expect(result.versionLabel).toBe('1.0.0');
+  });
+
+  it('uses latest data but returns empty version when versionId is an empty string', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-weather',
+      version: '1.0.0',
+      status: 1,
+      source: 'system',
+      isToolSet: false,
+      avatar: 'weather.svg',
+      name: 'Weather',
+      intro: 'Weather query',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-weather',
+      versionId: '',
+      lang: 'en'
+    });
+
+    expect(mocks.getSystemToolDetail).toHaveBeenCalledWith({
+      pluginId: 'systemTool-weather',
+      version: undefined,
+      lang: 'en',
+      source: 'system'
+    });
+    expect(result.version).toBe('');
+    expect(result.versionLabel).toBeUndefined();
+  });
+
+  it('passes explicit debug source without encoding it into plugin id', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-weather',
+      version: '1.0.0',
+      status: 1,
+      source: 'debug:tmbId:tmb-1',
+      isToolSet: false,
+      avatar: 'weather.svg',
+      name: 'Weather',
+      intro: 'Weather query',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-weather',
+      versionId: '',
+      lang: 'en',
+      source: 'debug:tmbId:tmb-1'
+    });
+
+    expect(mocks.getSystemToolDetail).toHaveBeenCalledWith({
+      pluginId: 'systemTool-weather',
+      version: undefined,
+      lang: 'en',
+      source: 'debug:tmbId:tmb-1'
+    });
+    expect(result.pluginId).toBe('systemTool-weather');
+    expect(result.source).toBe('debug:tmbId:tmb-1');
+    expect(result.toolConfig?.systemTool).toEqual({
+      toolId: 'systemTool-weather',
+      source: 'debug:tmbId:tmb-1'
+    });
+  });
+
+  it('persists and authorizes the explicit team source', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-weather',
+      version: '1.0.0',
+      status: 1,
+      source: 'teamId:team-1',
+      isToolSet: false,
+      avatar: 'weather.svg',
+      name: 'Weather',
+      intro: 'Weather query',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-weather',
+      versionId: '',
+      lang: 'en',
+      source: 'teamId:team-1',
+      teamId: 'team-1'
+    });
+
+    expect(mocks.assertTeamPluginSourceAccess).toHaveBeenCalledWith({
+      teamId: 'team-1',
+      source: 'teamId:team-1',
+      pluginId: 'weather'
+    });
+    expect(mocks.getSystemToolDetail).toHaveBeenCalledWith({
+      pluginId: 'systemTool-weather',
+      version: undefined,
+      lang: 'en',
+      source: 'teamId:team-1'
+    });
+    expect(result.source).toBe('teamId:team-1');
+    expect(result.toolConfig?.systemTool).toEqual({
+      toolId: 'systemTool-weather',
+      source: 'teamId:team-1'
+    });
+  });
+
+  it('writes explicit debug source into system toolset config', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'systemTool-search',
+      version: '1.0.0',
+      status: 1,
+      source: 'debug:tmbId:tmb-1',
+      isToolSet: true,
+      avatar: 'search.svg',
+      name: 'Search',
+      intro: 'Search tools',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 0,
+      systemKeyCost: 0,
+      hasTokenFee: false,
+      hasSystemSecret: false,
+      children: [
+        {
+          id: 'web',
+          name: 'Web Search',
+          description: 'Search web'
+        }
+      ]
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'systemTool-search',
+      versionId: '',
+      lang: 'en',
+      source: 'debug:tmbId:tmb-1'
+    });
+
+    expect(result.source).toBe('debug:tmbId:tmb-1');
+    expect(result.toolConfig?.systemToolSet).toMatchObject({
+      toolId: 'systemTool-search',
+      source: 'debug:tmbId:tmb-1'
+    });
+  });
+
+  it('returns plugin module preview for commercial workflow tools', async () => {
+    mocks.getSystemToolDetail.mockResolvedValueOnce({
+      id: 'commercial-workflow-tool',
+      version: 'workflow-version',
+      status: 1,
+      source: 'system',
+      versionLabel: 'Workflow v1',
+      isToolSet: false,
+      avatar: 'workflow.svg',
+      name: 'Workflow Tool',
+      intro: 'Workflow tool intro',
+      author: 'FastGPT',
+      tags: [],
+      currentCost: 1,
+      systemKeyCost: 0,
+      hasTokenFee: true,
+      hasSystemSecret: false,
+      associatedPluginId: 'app-id',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            title: 'Query'
+          }
+        },
+        required: ['query']
+      },
+      outputSchema: {
+        type: 'object',
+        properties: {
+          result: {
+            type: 'string',
+            title: 'Result'
+          }
+        }
+      }
+    });
+
+    const result = await getClientSystemToolPreviewNode({
+      pluginId: 'commercial-workflow-tool',
+      versionId: 'workflow-version',
+      lang: 'en'
+    });
+
+    expect(result.flowNodeType).toBe(FlowNodeTypeEnum.pluginModule);
+    expect(result.pluginId).toBe('commercial-workflow-tool');
+    expect(result.avatar).toBe('workflow.svg');
+    expect(result.toolConfig).toBeUndefined();
+    expect(result.isFolder).toBe(false);
+    expect(result.inputs[0]?.key).toBe('query');
+    expect(result.version).toBe('workflow-version');
+    expect(result.versionLabel).toBe('Workflow v1');
+  });
+});

@@ -1,0 +1,131 @@
+import { CommonPerKeyEnum, CommonRolePerMap } from '../constant';
+import type {
+  PermissionListType,
+  PermissionValueType,
+  RoleListType,
+  RolePerMapType
+} from '../type';
+import { CommonRoleList, CommonPerList } from '../constant';
+import { i18nT } from '../../../common/i18n/utils';
+import { sumPer } from '../utils';
+
+export enum TeamPerKeyEnum {
+  appCreate = 'appCreate',
+  datasetCreate = 'datasetCreate',
+  apikeyCreate = 'apikeyCreate',
+  skillCreate = 'skillCreate',
+  modelCreate = 'modelCreate'
+}
+
+export enum TeamRoleKeyEnum {
+  appCreate = 'appCreate',
+  datasetCreate = 'datasetCreate',
+  apikeyCreate = 'apikeyCreate',
+  skillCreate = 'skillCreate',
+  modelCreate = 'modelCreate'
+}
+
+/* 团队权限位：0~2 为通用权限（管/写/读），3~7 为资源创建权限 */
+export const TeamPerList: PermissionListType<TeamPerKeyEnum> = {
+  ...CommonPerList,
+  appCreate: 0b00001000,
+  datasetCreate: 0b00010000,
+  apikeyCreate: 0b00100000,
+  skillCreate: 0b01000000,
+  modelCreate: 0b10000000
+};
+
+export const TeamRoleList: RoleListType<TeamRoleKeyEnum> = {
+  [CommonPerKeyEnum.read]: {
+    ...CommonRoleList[CommonPerKeyEnum.read],
+    name: i18nT('common:permission.common_member'),
+    value: 0b00000100
+  },
+  [CommonPerKeyEnum.write]: {
+    ...CommonRoleList[CommonPerKeyEnum.write],
+    value: 0b00000010,
+    checkBoxType: 'hidden'
+  },
+  [CommonPerKeyEnum.manage]: {
+    ...CommonRoleList[CommonPerKeyEnum.manage],
+    value: 0b00000001
+  },
+  [TeamRoleKeyEnum.appCreate]: {
+    checkBoxType: 'multiple',
+    description: '',
+    name: i18nT('account_team:permission_appCreate'),
+    value: 0b00001000
+  },
+  [TeamRoleKeyEnum.datasetCreate]: {
+    checkBoxType: 'multiple',
+    description: '',
+    name: i18nT('account_team:permission_datasetCreate'),
+    value: 0b00010000
+  },
+  [TeamRoleKeyEnum.apikeyCreate]: {
+    checkBoxType: 'multiple',
+    description: '',
+    name: i18nT('account_team:permission_apikeyCreate'),
+    value: 0b00100000
+  },
+  [TeamRoleKeyEnum.skillCreate]: {
+    checkBoxType: 'multiple',
+    description: '',
+    name: i18nT('account_team:permission_skillCreate'),
+    value: 0b01000000
+  },
+  [TeamRoleKeyEnum.modelCreate]: {
+    checkBoxType: 'multiple',
+    description: '',
+    name: i18nT('account_team:permission_modelCreate'),
+    value: 0b10000000
+  }
+};
+
+export const TeamRolePerMap: RolePerMapType = new Map([
+  ...CommonRolePerMap,
+  [
+    TeamRoleList['appCreate'].value,
+    sumPer(TeamPerList.appCreate, CommonPerList.read, CommonPerList.write) as PermissionValueType
+  ],
+  [
+    TeamRoleList['datasetCreate'].value,
+    sumPer(
+      TeamPerList.datasetCreate,
+      CommonPerList.read,
+      CommonPerList.write
+    ) as PermissionValueType
+  ],
+  [
+    TeamRoleList['apikeyCreate'].value,
+    sumPer(TeamPerList.apikeyCreate, CommonPerList.read, CommonPerList.write) as PermissionValueType
+  ],
+  [
+    TeamRoleList['skillCreate'].value,
+    sumPer(TeamPerList.skillCreate, CommonPerList.read, CommonPerList.write) as PermissionValueType
+  ],
+  [
+    TeamRoleList['modelCreate'].value,
+    sumPer(TeamPerList.modelCreate, CommonPerList.read, CommonPerList.write) as PermissionValueType
+  ]
+]);
+
+export const TeamReadRoleVal = TeamRoleList['read'].value;
+export const TeamWriteRoleVal = TeamRoleList['write'].value;
+export const TeamManageRoleVal = TeamRoleList['manage'].value;
+export const TeamAppCreateRoleVal = TeamRoleList['appCreate'].value;
+export const TeamDatasetCreateRoleVal = TeamRoleList['datasetCreate'].value;
+export const TeamApikeyCreateRoleVal = TeamRoleList['apikeyCreate'].value;
+export const TeamSkillCreateRoleVal = TeamRoleList['skillCreate'].value;
+export const TeamModelCreateRoleVal = TeamRoleList['modelCreate'].value;
+export const TeamDefaultRoleVal = TeamReadRoleVal;
+
+export const TeamReadPermissionVal = TeamPerList.read;
+export const TeamWritePermissionVal = TeamPerList.write;
+export const TeamManagePermissionVal = TeamPerList.manage;
+export const TeamAppCreatePermissionVal = TeamPerList.appCreate;
+export const TeamDatasetCreatePermissionVal = TeamPerList.datasetCreate;
+export const TeamApikeyCreatePermissionVal = TeamPerList.apikeyCreate;
+export const TeamSkillCreatePermissionVal = TeamPerList.skillCreate;
+export const TeamModelCreatePermissionVal = TeamPerList.modelCreate;
+export const TeamDefaultPermissionVal = TeamReadPermissionVal;

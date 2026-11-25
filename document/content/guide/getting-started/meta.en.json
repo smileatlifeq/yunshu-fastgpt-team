@@ -1,0 +1,10 @@
+{
+  "title": "Getting Started",
+  "root": false,
+  "pages": [
+    "index",
+    "quick-start",
+    "[Video Tutorials (Chinese)](https://video.fastgpt.cn/videos)",
+    "[Example Solutions (Chinese)](https://solutions.fastgpt.cn/)"
+  ]
+}

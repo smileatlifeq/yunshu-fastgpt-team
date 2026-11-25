@@ -1,0 +1,2432 @@
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+  StreamResponseType
+} from '@fastgpt/global/core/ai/llm/type';
+import { ChatCompletionRequestMessageRoleEnum } from '@fastgpt/global/core/ai/constants';
+import { getErrText, UserConfigError } from '@fastgpt/global/common/error/utils';
+import type { LLMModelConfigType, LLMModelDataType } from '@fastgpt/global/core/ai/model/schema';
+import { ModelScopeEnum, ModelTypeEnum } from '@fastgpt/global/core/ai/constants';
+
+// Mock dependencies
+vi.mock('@fastgpt/service/core/ai/config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@fastgpt/service/core/ai/config')>()),
+  getAIApi: vi.fn(),
+  getAiproxyScopeHeaders: vi.fn(() => ({}))
+}));
+
+vi.mock('@fastgpt/service/core/ai/llm/utils', () => ({
+  loadRequestMessages: vi.fn()
+}));
+
+vi.mock('@fastgpt/service/common/string/tiktoken/index', () => ({
+  countGptMessagesTokens: vi.fn()
+}));
+
+vi.mock('@fastgpt/service/common/system/log', () => ({
+  addLog: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn()
+  }
+}));
+
+vi.mock('@fastgpt/service/core/ai/llm/promptCall', () => ({
+  parsePromptToolCall: vi.fn((content: string) => ({
+    answer: content,
+    streamAnswer: '',
+    toolCalls: undefined
+  })),
+  promptToolCallMessageRewrite: vi.fn((messages: any) => messages)
+}));
+
+vi.mock('@fastgpt/service/core/ai/record/controller', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@fastgpt/service/core/ai/record/controller')>()),
+  createLLMRequestId: vi.fn(() => 'test-request-id'),
+  saveLLMRequestRecord: vi.fn()
+}));
+
+vi.mock('@fastgpt/global/core/ai/llm/utils', () => ({
+  removeDatasetCiteText: vi.fn((text: string) => text),
+  normalizeToolResponseContent: vi.fn((content: unknown) =>
+    typeof content === 'string' ? content : JSON.stringify(content)
+  ),
+  getLLMSupportParams: vi.fn(() => ({
+    vision: false,
+    audio: false,
+    video: false,
+    multimodal: false,
+    temperature: true,
+    reasoning: false,
+    topP: true,
+    stop: true,
+    responseFormat: false,
+    supportToolCall: true
+  }))
+}));
+
+vi.mock('@fastgpt/service/core/ai/utils', () => ({
+  computedMaxToken: vi.fn(({ maxToken }: { maxToken?: number }) => maxToken || 4096),
+  computedTemperature: vi.fn(({ temperature }: { temperature: number }) => temperature),
+  parseLLMStreamResponse: vi.fn(),
+  parseReasoningContent: vi.fn((content: string) => ['', content])
+}));
+
+// Import mocked modules
+import { getAIApi } from '@fastgpt/service/core/ai/config';
+import { loadRequestMessages } from '@fastgpt/service/core/ai/llm/utils';
+import { countGptMessagesTokens } from '@fastgpt/service/common/string/tiktoken/index';
+import { parseLLMStreamResponse, parseReasoningContent } from '@fastgpt/service/core/ai/utils';
+import { getLLMSupportParams } from '@fastgpt/global/core/ai/llm/utils';
+import { promptToolCallMessageRewrite } from '@fastgpt/service/core/ai/llm/promptCall';
+import { saveLLMRequestRecord } from '@fastgpt/service/core/ai/record/controller';
+import { getLogger, LogCategories } from '@fastgpt/service/common/logger';
+
+import { createLLMResponse as rawCreateLLMResponse } from '@fastgpt/service/core/ai/llm/request';
+
+const mockGetAIApi = vi.mocked(getAIApi);
+const mockLoadRequestMessages = vi.mocked(loadRequestMessages);
+const mockCountGptMessagesTokens = vi.mocked(countGptMessagesTokens);
+const mockParseLLMStreamResponse = vi.mocked(parseLLMStreamResponse);
+const mockParseReasoningContent = vi.mocked(parseReasoningContent);
+const mockGetLLMSupportParams = vi.mocked(getLLMSupportParams);
+const mockPromptToolCallMessageRewrite = vi.mocked(promptToolCallMessageRewrite);
+const mockSaveLLMRequestRecord = vi.mocked(saveLLMRequestRecord);
+
+/** 为请求测试补齐默认团队，同时保留生产入口其余参数的真实类型约束。 */
+const createLLMResponse = (
+  args: Omit<Parameters<typeof rawCreateLLMResponse>[0], 'teamId'> & { teamId?: string }
+) => rawCreateLLMResponse({ ...args, teamId: args.teamId ?? 'team_1' });
+
+const createMockAIApiResult = (
+  ai: any,
+  requestMeta = {
+    usedUserOpenAIKey: false,
+    baseUrl: 'https://system.example.com/v1'
+  }
+) =>
+  ({
+    ai,
+    requestMeta
+  }) as any;
+
+const defaultSupportParams = {
+  vision: false,
+  audio: false,
+  video: false,
+  multimodal: false,
+  temperature: true,
+  reasoning: false,
+  reasoningEffort: false,
+  topP: true,
+  stop: true,
+  responseFormat: false,
+  supportToolCall: true
+};
+
+// Helper to create mock model data
+const createMockModelData = (
+  overrides?: Partial<Omit<LLMModelDataType, 'config'>> & {
+    config?: Partial<LLMModelConfigType>;
+  }
+): LLMModelDataType => ({
+  modelId: '68ad85a7463006c963799a05',
+  type: ModelTypeEnum.llm,
+  provider: 'openai',
+  model: 'gpt-4',
+  name: 'GPT-4',
+  isActive: true,
+  scope: ModelScopeEnum.system,
+  ...overrides,
+  config: {
+    maxContext: 128000,
+    maxResponse: 4096,
+    quoteMaxToken: 60000,
+    functionCall: true,
+    toolChoice: true,
+    reasoning: false,
+    ...overrides?.config
+  }
+});
+
+// Helper to create async generator for stream response
+async function* createAsyncGenerator<T>(items: T[]): AsyncGenerator<T, void, unknown> {
+  for (const item of items) {
+    yield item;
+  }
+}
+
+// Helper to create mock stream response
+const createMockStreamResponse = (chunks: any[]): StreamResponseType => {
+  const generator = createAsyncGenerator(chunks);
+  return Object.assign(generator, {
+    controller: { abort: vi.fn() }
+  }) as unknown as StreamResponseType;
+};
+
+describe('createLLMResponse', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    // Default mock setup
+    mockLoadRequestMessages.mockImplementation(async ({ messages }: any) => messages as any);
+    mockCountGptMessagesTokens.mockResolvedValue(100);
+    mockParseReasoningContent.mockImplementation((content: string) => ['', content]);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  describe('User key routing', () => {
+    it('preserves the actual user-key classification and partial output after a stream read fails', async () => {
+      const { parseLLMStreamResponse } = await vi.importActual<
+        typeof import('@fastgpt/service/core/ai/utils')
+      >('@fastgpt/service/core/ai/utils');
+      mockParseLLMStreamResponse.mockImplementationOnce(parseLLMStreamResponse);
+      const error = new Error('upstream disconnected');
+      async function* chunks() {
+        yield { choices: [{ delta: { content: 'partial' }, finish_reason: null }] };
+        throw error;
+      }
+      const response = Object.assign(chunks(), { controller: { abort: vi.fn() } });
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult(
+          { chat: { completions: { create: vi.fn().mockResolvedValue(response) } } },
+          { usedUserOpenAIKey: true, baseUrl: 'https://user.example.com/v1' }
+        )
+      );
+
+      const result = await createLLMResponse({
+        throwError: false,
+        saveLLMResponseRecord: false,
+        body: { model: createMockModelData(), messages: [], stream: true }
+      });
+
+      expect(result.error).toBeInstanceOf(UserConfigError);
+      expect(result.error.cause).toBe(error);
+      expect(result.answerText).toBe('partial');
+      expect(result.usage.usedUserOpenAIKey).toBe(true);
+      expect(result.finish_reason).toBe('error');
+    });
+
+    const mockTextResponse = {
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: 'ok'
+          },
+          finish_reason: 'stop'
+        }
+      ],
+      usage: {
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        total_tokens: 2
+      }
+    };
+
+    it('should ignore user baseUrl when user key is missing', async () => {
+      const modelData = createMockModelData({
+        requestUrl: 'https://model.example.com/v1/chat/completions',
+        requestAuth: 'model-key'
+      });
+      const createMock = vi.fn().mockResolvedValue(mockTextResponse);
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult(
+          {
+            chat: {
+              completions: {
+                create: createMock
+              }
+            }
+          },
+          {
+            usedUserOpenAIKey: false,
+            baseUrl: 'https://model.example.com/v1'
+          }
+        )
+      );
+
+      const result = await createLLMResponse({
+        userKey: {
+          baseUrl: 'https://user.example.com/v1'
+        } as any,
+        body: {
+          model: modelData,
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'hi' }],
+          stream: false
+        }
+      });
+
+      expect(result.usage.usedUserOpenAIKey).toBe(false);
+      expect(mockGetAIApi).toHaveBeenCalledWith({
+        userKey: {
+          baseUrl: 'https://user.example.com/v1'
+        },
+        timeout: 600000
+      });
+      expect(createMock.mock.calls[0][1]).toMatchObject({
+        path: 'https://model.example.com/v1/chat/completions',
+        headers: {
+          Authorization: 'Bearer model-key'
+        }
+      });
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            usage: expect.not.objectContaining({
+              usedUserOpenAIKey: expect.anything()
+            })
+          })
+        })
+      );
+    });
+
+    it('should use user key and default OpenAI baseUrl when only user key is provided', async () => {
+      const createMock = vi.fn().mockResolvedValue(mockTextResponse);
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult(
+          {
+            chat: {
+              completions: {
+                create: createMock
+              }
+            }
+          },
+          {
+            usedUserOpenAIKey: true,
+            baseUrl: 'https://api.openai.com/v1'
+          }
+        )
+      );
+
+      const result = await createLLMResponse({
+        userKey: {
+          key: 'user-key'
+        } as any,
+        body: {
+          model: createMockModelData(),
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'hi' }],
+          stream: false
+        }
+      });
+
+      expect(result.usage.usedUserOpenAIKey).toBe(true);
+      expect(mockGetAIApi).toHaveBeenCalledWith({
+        userKey: {
+          key: 'user-key'
+        },
+        timeout: 600000
+      });
+      expect(createMock.mock.calls[0][1]).not.toHaveProperty('path');
+      expect(createMock.mock.calls[0][1].headers).not.toHaveProperty('Authorization');
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            usage: expect.not.objectContaining({
+              usedUserOpenAIKey: expect.anything()
+            })
+          })
+        })
+      );
+    });
+
+    it('should pass custom timeout to the AI client', async () => {
+      const createMock = vi.fn().mockResolvedValue(mockTextResponse);
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult({
+          chat: {
+            completions: {
+              create: createMock
+            }
+          }
+        })
+      );
+
+      await createLLMResponse({
+        timeout: 15_000,
+        body: {
+          model: createMockModelData(),
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'hi' }],
+          stream: false
+        }
+      });
+
+      expect(mockGetAIApi).toHaveBeenCalledWith({
+        userKey: undefined,
+        timeout: 15_000
+      });
+    });
+
+    it('should not save usage when user request fails', async () => {
+      const createMock = vi.fn().mockRejectedValue(new Error('upstream failed'));
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult(
+          {
+            chat: {
+              completions: {
+                create: createMock
+              }
+            }
+          },
+          {
+            usedUserOpenAIKey: true,
+            baseUrl: 'https://api.openai.com/v1'
+          }
+        )
+      );
+
+      const result = await createLLMResponse({
+        throwError: false,
+        userKey: {
+          key: 'user-key'
+        } as any,
+        body: {
+          model: createMockModelData(),
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'hi' }],
+          stream: false
+        }
+      });
+
+      expect(result.usage).toEqual({
+        inputTokens: 0,
+        outputTokens: 0,
+        usedUserOpenAIKey: false
+      });
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            error: expect.stringContaining('您的 OpenAI key 出错了')
+          })
+        })
+      );
+      expect(mockSaveLLMRequestRecord.mock.calls[0][0].response).not.toHaveProperty('usage');
+    });
+
+    it('should skip saving error record when saveLLMResponseRecord is false', async () => {
+      const createMock = vi.fn().mockRejectedValue(new Error('upstream failed'));
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult({
+          chat: {
+            completions: {
+              create: createMock
+            }
+          }
+        })
+      );
+
+      const result = await createLLMResponse({
+        throwError: false,
+        saveLLMResponseRecord: false,
+        body: {
+          model: createMockModelData(),
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'hi' }],
+          stream: false
+        }
+      });
+
+      expect(result.finish_reason).toBe('error');
+      expect(mockSaveLLMRequestRecord).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Non-stream text output', () => {
+    it.each([false, true])(
+      'should redact empty-response logs and persisted hints with user key=%s',
+      async (usedUserOpenAIKey) => {
+        const logger = getLogger(LogCategories.MODULE.AI.LLM);
+        const log = vi
+          .spyOn(logger, usedUserOpenAIKey ? 'warn' : 'error')
+          .mockImplementation(() => {});
+        const base64 = 'A'.repeat(1_000_000);
+        const messages: ChatCompletionMessageParam[] = [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Analyze these media files.' },
+              { type: 'image_url', image_url: { url: `data:image/png;base64,${base64}` } },
+              { type: 'input_audio', input_audio: { data: base64, format: 'wav' } },
+              { type: 'video_url', video_url: { url: `data:video/mp4;base64,${base64}` } }
+            ]
+          }
+        ];
+        const create = vi.fn().mockResolvedValue({
+          choices: [{ message: { role: 'assistant', content: null }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 20, completion_tokens: 0, total_tokens: 20 }
+        });
+        mockGetAIApi.mockReturnValue(
+          createMockAIApiResult(
+            { chat: { completions: { create } } },
+            { usedUserOpenAIKey, baseUrl: 'https://system.example.com/v1' }
+          )
+        );
+        const result = await createLLMResponse({
+          body: { model: createMockModelData(), messages, stream: false }
+        });
+        const expectedMessages = [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Analyze these media files.' },
+              { type: 'image_url', image_url: { url: 'data:image/png;base64,[base64 omitted]' } },
+              { type: 'input_audio', input_audio: { data: '[base64 omitted]', format: 'wav' } },
+              { type: 'video_url', video_url: { url: 'data:video/mp4;base64,[base64 omitted]' } }
+            ]
+          }
+        ];
+        expect(log).toHaveBeenCalledExactlyOnceWith(
+          usedUserOpenAIKey ? 'User LLM response empty' : 'LLM response empty',
+          expect.objectContaining({
+            [usedUserOpenAIKey ? 'requestBody' : 'data']: expect.objectContaining({
+              messages: expectedMessages
+            }),
+            finish_reason: 'stop'
+          })
+        );
+        expect(JSON.stringify(log.mock.calls)).not.toContain(base64);
+        expect(result.responseEmptyTip).toEqual(
+          usedUserOpenAIKey ? '您的 OpenAI key 没有响应' : 'chat:LLM_model_response_empty'
+        );
+        expect(result.responseEmptyTip).not.toContain(base64);
+        expect(mockSaveLLMRequestRecord).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            response: expect.objectContaining({ error: result.responseEmptyTip })
+          })
+        );
+        expect(JSON.stringify(mockSaveLLMRequestRecord.mock.calls[0][0].response)).not.toContain(
+          base64
+        );
+        expect(create.mock.calls[0][0].messages).toEqual(messages);
+      }
+    );
+
+    it('should normalize split assistant fields before sending request', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok'
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 2,
+          total_tokens: 12
+        }
+      };
+      const createMock = vi.fn().mockResolvedValue(mockResponse);
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult({
+          chat: {
+            completions: {
+              create: createMock
+            }
+          }
+        })
+      );
+
+      const toolCall: ChatCompletionMessageToolCall = {
+        id: 'call_update_plan',
+        type: 'function',
+        function: {
+          name: 'update_plan',
+          arguments: '{"updates":[]}'
+        }
+      };
+
+      await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages: [
+            { role: ChatCompletionRequestMessageRoleEnum.User, content: 'make a plan' },
+            {
+              role: ChatCompletionRequestMessageRoleEnum.Assistant,
+              reasoning_content: 'Need to create a plan.'
+            },
+            {
+              role: ChatCompletionRequestMessageRoleEnum.Assistant,
+              tool_calls: [toolCall]
+            },
+            {
+              role: ChatCompletionRequestMessageRoleEnum.Tool,
+              tool_call_id: 'call_update_plan',
+              content: 'Created active plan.'
+            }
+          ],
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'update_plan',
+                description: 'Update plan',
+                parameters: {
+                  type: 'object',
+                  properties: {}
+                }
+              }
+            }
+          ],
+          stream: false
+        }
+      });
+
+      expect(createMock.mock.calls[0][0].messages).toEqual([
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'make a plan' },
+        {
+          role: ChatCompletionRequestMessageRoleEnum.Assistant,
+          reasoning_content: 'Need to create a plan.',
+          tool_calls: [toolCall]
+        },
+        {
+          role: ChatCompletionRequestMessageRoleEnum.Tool,
+          tool_call_id: 'call_update_plan',
+          content: 'Created active plan.'
+        }
+      ]);
+    });
+
+    it('should handle simple non-stream text response', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Hello! How can I help you?'
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 8,
+          total_tokens: 18
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      let streamedText = '';
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        },
+        onStreaming: ({ text }) => {
+          streamedText += text;
+        }
+      });
+
+      expect(result.isStreamResponse).toBe(false);
+      expect(result.answerText).toBe('Hello! How can I help you?');
+      expect(result.reasoningText).toBe('');
+      expect(result.finish_reason).toBe('stop');
+      expect(result.toolCalls).toBeUndefined();
+      expect(streamedText).toBe('Hello! How can I help you?');
+    });
+
+    it('should skip saving request record when saveLLMResponseRecord is false', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Internal helper response'
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 5,
+          completion_tokens: 3,
+          total_tokens: 8
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const result = await createLLMResponse({
+        saveLLMResponseRecord: false,
+        body: {
+          model: createMockModelData(),
+          messages: [
+            { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Generate title' }
+          ],
+          stream: false
+        }
+      });
+
+      expect(result.answerText).toBe('Internal helper response');
+      expect(result.usage).toEqual({
+        inputTokens: 5,
+        outputTokens: 3,
+        usedUserOpenAIKey: false
+      });
+      expect(mockSaveLLMRequestRecord).not.toHaveBeenCalled();
+    });
+
+    it('should fill stop finish reason for non-stream response when finish reason is missing', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Hello without finish reason'
+            },
+            finish_reason: null
+          }
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 4,
+          total_tokens: 14
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        }
+      });
+
+      expect(result.answerText).toBe('Hello without finish reason');
+      expect(result.finish_reason).toBe('stop');
+      expect(result.error).toBeUndefined();
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            answerText: 'Hello without finish reason',
+            finish_reason: 'stop',
+            error: undefined
+          })
+        })
+      );
+    });
+
+    it('should handle non-stream response with null content', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: null
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 0,
+          total_tokens: 10
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        }
+      });
+
+      expect(result.answerText).toBe('');
+      expect(result.responseEmptyTip).toBeDefined();
+    });
+  });
+
+  describe('Stream text output', () => {
+    it('should handle simple stream text response', async () => {
+      const chunks = [
+        {
+          choices: [{ delta: { role: 'assistant', content: 'Hello' }, finish_reason: null }]
+        },
+        {
+          choices: [{ delta: { content: ' World' }, finish_reason: null }]
+        },
+        {
+          choices: [{ delta: { content: '!' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }
+        }
+      ];
+
+      const mockStreamResponse = createMockStreamResponse(chunks);
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockStreamResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      // Mock parseLLMStreamResponse
+      let contentBuffer = '';
+      mockParseLLMStreamResponse.mockReturnValue({
+        parsePart: ({ part }: { part: any }) => {
+          const content = part.choices?.[0]?.delta?.content || '';
+          contentBuffer += content;
+          return {
+            reasoningContent: '',
+            content,
+            responseContent: content,
+            finishReason: part.choices?.[0]?.finish_reason || null
+          };
+        },
+        getResponseData: () => ({
+          error: undefined,
+          reasoningContent: '',
+          content: contentBuffer,
+          finish_reason: 'stop' as const,
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }
+        }),
+        updateFinishReason: vi.fn(),
+        updateError: vi.fn()
+      });
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hi' }
+      ];
+
+      let streamedText = '';
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: true
+        },
+        onStreaming: ({ text }) => {
+          streamedText += text;
+        }
+      });
+
+      expect(result.isStreamResponse).toBe(true);
+      expect(result.answerText).toBe('Hello World!');
+      expect(result.finish_reason).toBe('stop');
+      expect(streamedText).toBe('Hello World!');
+    });
+
+    it('should fill abnormal close finish reason for partial stream response when finish reason is missing', async () => {
+      const chunks = [
+        {
+          choices: [
+            { delta: { role: 'assistant', content: 'Partial answer' }, finish_reason: null }
+          ]
+        }
+      ];
+
+      const mockStreamResponse = createMockStreamResponse(chunks);
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockStreamResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      let contentBuffer = '';
+      mockParseLLMStreamResponse.mockReturnValue({
+        parsePart: ({ part }: { part: any }) => {
+          const content = part.choices?.[0]?.delta?.content || '';
+          contentBuffer += content;
+          return {
+            reasoningContent: '',
+            content,
+            responseContent: content,
+            finishReason: part.choices?.[0]?.finish_reason || null
+          };
+        },
+        getResponseData: () => ({
+          error: undefined,
+          reasoningContent: '',
+          content: contentBuffer,
+          finish_reason: null,
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }
+        }),
+        updateFinishReason: vi.fn(),
+        updateError: vi.fn()
+      });
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hi' }
+      ];
+
+      let streamedText = '';
+      const result = await createLLMResponse({
+        throwError: false,
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: true
+        },
+        onStreaming: ({ text }) => {
+          streamedText += text;
+        }
+      });
+
+      expect(result.answerText).toBe('Partial answer');
+      expect(result.finish_reason).toBe('abnormal_close');
+      expect(result.error).toBeUndefined();
+      expect(result.responseEmptyTip).toBeUndefined();
+      expect(streamedText).toBe('Partial answer');
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            answerText: 'Partial answer',
+            finish_reason: 'abnormal_close',
+            error: undefined
+          })
+        })
+      );
+    });
+
+    it('should handle stream response abort', async () => {
+      const chunks = [
+        {
+          choices: [{ delta: { role: 'assistant', content: 'Hello' }, finish_reason: null }]
+        },
+        {
+          choices: [{ delta: { content: ' World' }, finish_reason: null }]
+        }
+      ];
+
+      const mockStreamResponse = createMockStreamResponse(chunks);
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockStreamResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      let contentBuffer = '';
+      let currentFinishReason: any = null;
+      mockParseLLMStreamResponse.mockReturnValue({
+        parsePart: ({ part }: { part: any }) => {
+          const content = part.choices?.[0]?.delta?.content || '';
+          contentBuffer += content;
+          return {
+            reasoningContent: '',
+            content,
+            responseContent: content,
+            finishReason: part.choices?.[0]?.finish_reason || null
+          };
+        },
+        getResponseData: () => ({
+          error: undefined,
+          reasoningContent: '',
+          content: contentBuffer,
+          finish_reason: currentFinishReason,
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }
+        }),
+        updateFinishReason: (reason: any) => {
+          currentFinishReason = reason;
+        },
+        updateError: vi.fn()
+      });
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hi' }
+      ];
+
+      let callCount = 0;
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: true
+        },
+        isAborted: () => {
+          callCount++;
+          return callCount > 1; // Abort after first chunk
+        }
+      });
+
+      expect(result.finish_reason).toBe('close');
+    });
+  });
+
+  describe('Reasoning (thinking) output', () => {
+    it('should handle non-stream response with reasoning_content', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'The answer is 4.',
+              reasoning_content: 'Let me think... 2 + 2 = 4'
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 20,
+          total_tokens: 30
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'What is 2 + 2?' }
+      ];
+
+      let reasoningText = '';
+      let answerText = '';
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        },
+        onReasoning: ({ text }) => {
+          reasoningText += text;
+        },
+        onStreaming: ({ text }) => {
+          answerText += text;
+        }
+      });
+
+      expect(result.answerText).toBe('The answer is 4.');
+      expect(result.reasoningText).toBe('Let me think... 2 + 2 = 4');
+      expect(reasoningText).toBe('Let me think... 2 + 2 = 4');
+      expect(answerText).toBe('The answer is 4.');
+    });
+
+    it('should handle non-stream response with think tag in content', async () => {
+      mockParseReasoningContent.mockReturnValue(['Thinking process here', 'Final answer']);
+
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: '<think>Thinking process here</think>Final answer'
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 15,
+          total_tokens: 25
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Think about this' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData({ config: { reasoning: true } }),
+          messages,
+          stream: false
+        }
+      });
+
+      expect(result.answerText).toBe('Final answer');
+      expect(result.reasoningText).toBe('Thinking process here');
+    });
+
+    it('should handle stream response with reasoning_content', async () => {
+      const chunks = [
+        {
+          choices: [
+            { delta: { role: 'assistant', reasoning_content: 'Let me ' }, finish_reason: null }
+          ]
+        },
+        {
+          choices: [{ delta: { reasoning_content: 'think...' }, finish_reason: null }]
+        },
+        {
+          choices: [{ delta: { content: 'The answer ' }, finish_reason: null }]
+        },
+        {
+          choices: [{ delta: { content: 'is 4.' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 15, total_tokens: 25 }
+        }
+      ];
+
+      const mockStreamResponse = createMockStreamResponse(chunks);
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockStreamResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      let contentBuffer = '';
+      let reasoningBuffer = '';
+      mockParseLLMStreamResponse.mockReturnValue({
+        parsePart: ({ part }: { part: any }) => {
+          const content = part.choices?.[0]?.delta?.content || '';
+          const reasoning = part.choices?.[0]?.delta?.reasoning_content || '';
+          contentBuffer += content;
+          reasoningBuffer += reasoning;
+          return {
+            reasoningContent: reasoning,
+            content,
+            responseContent: content,
+            finishReason: part.choices?.[0]?.finish_reason || null
+          };
+        },
+        getResponseData: () => ({
+          error: undefined,
+          reasoningContent: reasoningBuffer,
+          content: contentBuffer,
+          finish_reason: 'stop' as const,
+          usage: { prompt_tokens: 10, completion_tokens: 15, total_tokens: 25 }
+        }),
+        updateFinishReason: vi.fn(),
+        updateError: vi.fn()
+      });
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'What is 2 + 2?' }
+      ];
+
+      let reasoningText = '';
+      let answerText = '';
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: true
+        },
+        onReasoning: ({ text }) => {
+          reasoningText += text;
+        },
+        onStreaming: ({ text }) => {
+          answerText += text;
+        }
+      });
+
+      expect(result.answerText).toBe('The answer is 4.');
+      expect(result.reasoningText).toBe('Let me think...');
+      expect(reasoningText).toBe('Let me think...');
+      expect(answerText).toBe('The answer is 4.');
+    });
+  });
+
+  describe('Tool call output', () => {
+    it('should handle non-stream tool call response', async () => {
+      const mockToolCalls: ChatCompletionMessageToolCall[] = [
+        {
+          id: 'call_123',
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            arguments: '{"location": "Beijing"}'
+          }
+        }
+      ];
+
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: mockToolCalls
+            },
+            finish_reason: 'tool_calls'
+          }
+        ],
+        usage: {
+          prompt_tokens: 20,
+          completion_tokens: 15,
+          total_tokens: 35
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const tools = [
+        {
+          type: 'function' as const,
+          function: {
+            name: 'get_weather',
+            description: 'Get weather information',
+            parameters: {
+              type: 'object',
+              properties: {
+                location: { type: 'string' }
+              }
+            }
+          }
+        }
+      ];
+
+      const messages: ChatCompletionMessageParam[] = [
+        {
+          role: ChatCompletionRequestMessageRoleEnum.User,
+          content: "What's the weather in Beijing?"
+        }
+      ];
+
+      const toolCallResults: ChatCompletionMessageToolCall[] = [];
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          tools,
+          stream: false
+        },
+        onToolCall: ({ call }) => {
+          toolCallResults.push(call);
+        }
+      });
+
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0].function.name).toBe('get_weather');
+      expect(result.toolCalls![0].function.arguments).toBe('{"location": "Beijing"}');
+      expect(result.finish_reason).toBe('tool_calls');
+      expect(toolCallResults).toHaveLength(1);
+    });
+
+    it('should handle stream tool call response', async () => {
+      const chunks = [
+        {
+          choices: [
+            {
+              delta: {
+                role: 'assistant',
+                tool_calls: [{ index: 0, function: { name: 'get_weather', arguments: '' } }]
+              },
+              finish_reason: null
+            }
+          ]
+        },
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [{ index: 0, function: { arguments: '{"loc' } }]
+              },
+              finish_reason: null
+            }
+          ]
+        },
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [{ index: 0, function: { arguments: 'ation":' } }]
+              },
+              finish_reason: null
+            }
+          ]
+        },
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [{ index: 0, function: { arguments: '"Beijing"}' } }]
+              },
+              finish_reason: 'tool_calls'
+            }
+          ],
+          usage: { prompt_tokens: 20, completion_tokens: 15, total_tokens: 35 }
+        }
+      ];
+
+      const mockStreamResponse = createMockStreamResponse(chunks);
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockStreamResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      mockParseLLMStreamResponse.mockReturnValue({
+        parsePart: ({ part }: { part: any }) => {
+          return {
+            reasoningContent: '',
+            content: '',
+            responseContent: '',
+            finishReason: part.choices?.[0]?.finish_reason || null
+          };
+        },
+        getResponseData: () => ({
+          error: undefined,
+          reasoningContent: '',
+          content: '',
+          finish_reason: 'tool_calls' as const,
+          usage: { prompt_tokens: 20, completion_tokens: 15, total_tokens: 35 }
+        }),
+        updateFinishReason: vi.fn(),
+        updateError: vi.fn()
+      });
+
+      const tools = [
+        {
+          type: 'function' as const,
+          function: {
+            name: 'get_weather',
+            description: 'Get weather information',
+            parameters: {
+              type: 'object',
+              properties: {
+                location: { type: 'string' }
+              }
+            }
+          }
+        }
+      ];
+
+      const messages: ChatCompletionMessageParam[] = [
+        {
+          role: ChatCompletionRequestMessageRoleEnum.User,
+          content: "What's the weather in Beijing?"
+        }
+      ];
+
+      const toolCallResults: ChatCompletionMessageToolCall[] = [];
+      const toolParamResults: string[] = [];
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          tools,
+          stream: true
+        },
+        onToolCall: ({ call }) => {
+          toolCallResults.push(call);
+        },
+        onToolParam: ({ argsDelta }) => {
+          toolParamResults.push(argsDelta);
+        }
+      });
+
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0].function.name).toBe('get_weather');
+      expect(result.finish_reason).toBe('tool_calls');
+      expect(toolCallResults.length).toBeGreaterThan(0);
+    });
+
+    it('should log missing tool calls even when request records are disabled', async () => {
+      const logError = vi
+        .spyOn(getLogger(LogCategories.MODULE.AI.LLM), 'error')
+        .mockImplementation(() => {});
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult({
+          chat: {
+            completions: {
+              create: vi.fn().mockResolvedValue({
+                choices: [
+                  {
+                    message: { role: 'assistant', content: null, tool_calls: [] },
+                    finish_reason: 'tool_calls'
+                  }
+                ]
+              })
+            }
+          }
+        })
+      );
+
+      const result = await createLLMResponse({
+        throwError: false,
+        saveLLMResponseRecord: false,
+        body: { model: createMockModelData(), messages: [], stream: false }
+      });
+
+      expect(result.finish_reason).toBe('tool_calls');
+      expect(result.error.message).toBe(
+        'LLM tool call error: no valid tool calls matched the requested tools.'
+      );
+      expect(result.responseEmptyTip).toBeUndefined();
+      expect(logError).toHaveBeenCalledExactlyOnceWith('LLM tool calls missing', {
+        requestBody: expect.any(Object),
+        message: result.error.message
+      });
+      expect(mockSaveLLMRequestRecord).not.toHaveBeenCalled();
+    });
+
+    it('should redact media and persist only the final tool result for invalid tool output', async () => {
+      const controller = await vi.importActual<
+        typeof import('@fastgpt/service/core/ai/record/controller')
+      >('@fastgpt/service/core/ai/record/controller');
+      mockSaveLLMRequestRecord.mockImplementationOnce(controller.saveLLMRequestRecord);
+      const logError = vi
+        .spyOn(getLogger(LogCategories.MODULE.AI.LLM), 'error')
+        .mockImplementation(() => {});
+      const imageUrl = `data:image/png;base64,${'A'.repeat(2_000_000)}`;
+      const messages: ChatCompletionMessageParam[] = [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this image.' },
+            { type: 'image_url', image_url: { url: imageUrl } }
+          ]
+        }
+      ];
+      const toolCalls: ChatCompletionMessageToolCall[] = [
+        {
+          id: 'original_invalid_call',
+          type: 'function',
+          function: { name: 'unknown_tool', arguments: ' \t' }
+        }
+      ];
+      const response = {
+        choices: [
+          {
+            message: { role: 'assistant', content: 'original model answer', tool_calls: toolCalls },
+            finish_reason: 'tool_calls'
+          }
+        ],
+        usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 }
+      };
+      const originalResponse = structuredClone(response);
+      const mockCreate = vi.fn().mockResolvedValue(response);
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult({ chat: { completions: { create: mockCreate } } })
+      );
+      const result = await createLLMResponse({
+        teamId: '507f1f77bcf86cd799439011',
+        throwError: false,
+        body: {
+          model: createMockModelData(),
+          messages,
+          tools: [
+            { type: 'function', function: { name: 'search', parameters: { type: 'object' } } }
+          ],
+          stream: false
+        }
+      });
+      expect(result.finish_reason).toBe('tool_calls');
+      expect(logError).toHaveBeenCalledExactlyOnceWith('LLM tool calls missing', {
+        requestBody: expect.objectContaining({
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Describe this image.' },
+                {
+                  type: 'image_url',
+                  image_url: { url: 'data:image/png;base64,[base64 omitted]' }
+                }
+              ]
+            }
+          ]
+        }),
+        message: result.error.message
+      });
+      expect(mockCreate.mock.calls[0][0].messages).toEqual(messages);
+      expect(JSON.stringify(logError.mock.calls)).not.toContain(imageUrl);
+      await mockSaveLLMRequestRecord.mock.results[0].value;
+      const record = await controller.getLLMRequestRecord(
+        result.requestId,
+        '507f1f77bcf86cd799439011'
+      );
+      expect(record?.response).toMatchObject({
+        answerText: 'original model answer',
+        finish_reason: 'tool_calls',
+        usage: { inputTokens: 20, outputTokens: 5 }
+      });
+      expect(record?.response).not.toHaveProperty('error');
+      expect(record?.response).not.toHaveProperty('toolCalls');
+      expect(record?.body.messages[0].content[1].image_url.url).toBe(
+        'data:image/png;base64,[base64 omitted]'
+      );
+      expect(response).toEqual(originalResponse);
+    });
+
+    it('should log only the request body and message when continued tool outputs are invalid', async () => {
+      const logError = vi
+        .spyOn(getLogger(LogCategories.MODULE.AI.LLM), 'error')
+        .mockImplementation(() => {});
+      const calls = ['unknown_first', 'unknown_tool'].map<ChatCompletionMessageToolCall>(
+        (name, i) => ({
+          id: `call_${i}`,
+          type: 'function',
+          function: { name, arguments: i === 0 ? '{"q":1}' : ' \t' }
+        })
+      );
+      const create = vi.fn();
+      calls.forEach((call, i) => {
+        create.mockResolvedValueOnce({
+          choices: [
+            {
+              message: { role: 'assistant', content: `part ${i}`, tool_calls: [call] },
+              finish_reason: i === 0 ? 'length' : 'tool_calls'
+            }
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+        });
+      });
+      mockGetAIApi.mockReturnValue(createMockAIApiResult({ chat: { completions: { create } } }));
+      const messages: ChatCompletionMessageParam[] = [{ role: 'user', content: 'Search.' }];
+      const result = await createLLMResponse({
+        throwError: false,
+        maxContinuations: 2,
+        body: {
+          model: createMockModelData(),
+          messages,
+          tools: [
+            { type: 'function', function: { name: 'search', parameters: { type: 'object' } } }
+          ],
+          stream: false
+        }
+      });
+
+      expect(result.finish_reason).toBe('tool_calls');
+      expect(result.error.message).toBe(
+        'LLM tool call error: no valid tool calls matched the requested tools.'
+      );
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(logError).toHaveBeenCalledExactlyOnceWith('LLM tool calls missing', {
+        requestBody: expect.objectContaining({ messages }),
+        message: result.error.message
+      });
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          body: expect.objectContaining({ messages }),
+          response: expect.objectContaining({
+            finish_reason: 'tool_calls',
+            error: undefined,
+            usage: { inputTokens: 20, outputTokens: 4 }
+          })
+        })
+      );
+      expect(mockSaveLLMRequestRecord.mock.calls[0][0].response).not.toHaveProperty('toolCalls');
+    });
+
+    it('should handle multiple tool calls in non-stream response', async () => {
+      const mockToolCalls: ChatCompletionMessageToolCall[] = [
+        {
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            arguments: '{"location": "Beijing"}'
+          }
+        },
+        {
+          id: 'call_2',
+          type: 'function',
+          function: {
+            name: 'get_time',
+            arguments: '{"timezone": "Asia/Shanghai"}'
+          }
+        }
+      ];
+
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: mockToolCalls
+            },
+            finish_reason: 'tool_calls'
+          }
+        ],
+        usage: {
+          prompt_tokens: 25,
+          completion_tokens: 30,
+          total_tokens: 55
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const tools = [
+        {
+          type: 'function' as const,
+          function: {
+            name: 'get_weather',
+            description: 'Get weather',
+            parameters: { type: 'object', properties: { location: { type: 'string' } } }
+          }
+        },
+        {
+          type: 'function' as const,
+          function: {
+            name: 'get_time',
+            description: 'Get time',
+            parameters: { type: 'object', properties: { timezone: { type: 'string' } } }
+          }
+        }
+      ];
+
+      const messages: ChatCompletionMessageParam[] = [
+        {
+          role: ChatCompletionRequestMessageRoleEnum.User,
+          content: "What's the weather and time in Beijing?"
+        }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          tools,
+          stream: false
+        }
+      });
+
+      expect(result.toolCalls).toHaveLength(2);
+      expect(result.toolCalls![0].function.name).toBe('get_weather');
+      expect(result.toolCalls![1].function.name).toBe('get_time');
+    });
+  });
+
+  describe('Mixed output (text + tool calls)', () => {
+    it('should handle response with both text and tool calls', async () => {
+      const mockToolCalls: ChatCompletionMessageToolCall[] = [
+        {
+          id: 'call_123',
+          type: 'function',
+          function: {
+            name: 'search',
+            arguments: '{"query": "AI news"}'
+          }
+        }
+      ];
+
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Let me search for that.',
+              tool_calls: mockToolCalls
+            },
+            finish_reason: 'tool_calls'
+          }
+        ],
+        usage: {
+          prompt_tokens: 15,
+          completion_tokens: 20,
+          total_tokens: 35
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const tools = [
+        {
+          type: 'function' as const,
+          function: {
+            name: 'search',
+            description: 'Search the web',
+            parameters: { type: 'object', properties: { query: { type: 'string' } } }
+          }
+        }
+      ];
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Search for AI news' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          tools,
+          stream: false
+        }
+      });
+
+      expect(result.answerText).toBe('Let me search for that.');
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0].function.name).toBe('search');
+    });
+  });
+
+  describe('Error handling', () => {
+    it('should handle API error with throwError=true', async () => {
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockRejectedValue(new Error('API Error'))
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      await expect(
+        createLLMResponse({
+          throwError: true,
+          body: {
+            model: createMockModelData(),
+            messages,
+            stream: false
+          }
+        })
+      ).rejects.toThrow();
+    });
+
+    it.each(
+      [
+        { kind: 'Error instance', error: new Error('upstream quota exhausted') },
+        {
+          kind: 'API object',
+          error: { message: 'upstream quota exhausted', code: 'quota_exceeded' }
+        },
+        { kind: 'API string', error: 'upstream quota exhausted' }
+      ].flatMap((scenario) => [undefined, false].map((throwError) => ({ ...scenario, throwError })))
+    )(
+      'should expose $kind ahead of the known tool error with throwError=$throwError',
+      async ({ error, throwError }) => {
+        const logError = vi
+          .spyOn(getLogger(LogCategories.MODULE.AI.LLM), 'error')
+          .mockImplementation(() => {});
+        const create = vi.fn().mockResolvedValue({
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'partial model answer',
+                tool_calls: [
+                  {
+                    id: 'invalid_call',
+                    type: 'function',
+                    function: { name: 'unknown_tool', arguments: '{}' }
+                  }
+                ]
+              },
+              finish_reason: 'tool_calls'
+            }
+          ],
+          error,
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+        });
+        mockGetAIApi.mockReturnValue(createMockAIApiResult({ chat: { completions: { create } } }));
+        const messages: ChatCompletionMessageParam[] = [{ role: 'user', content: 'Search.' }];
+        const request = createLLMResponse({
+          throwError,
+          body: {
+            model: createMockModelData(),
+            messages,
+            tools: [
+              { type: 'function', function: { name: 'search', parameters: { type: 'object' } } }
+            ],
+            stream: false
+          }
+        });
+
+        if (throwError === false) {
+          const result = await request;
+          expect(result.error).toBe(error);
+          expect(getErrText(result.error)).toBe('upstream quota exhausted');
+          expect(result.finish_reason).toBe('error');
+          expect(result.answerText).toBe('partial model answer');
+          expect(result.usage).toMatchObject({ inputTokens: 10, outputTokens: 2 });
+        } else {
+          await expect(request).rejects.toBe(error);
+        }
+        expect(mockSaveLLMRequestRecord).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            response: expect.objectContaining({
+              error,
+              usage: { inputTokens: 10, outputTokens: 2 }
+            })
+          })
+        );
+        expect(logError).not.toHaveBeenCalled();
+      }
+    );
+
+    it('should not save duplicate error record when response error is rethrown', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: ''
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        error: new Error('Some error'),
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 2,
+          total_tokens: 12
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      await expect(
+        createLLMResponse({
+          throwError: true,
+          body: {
+            model: createMockModelData(),
+            messages,
+            stream: false
+          }
+        })
+      ).rejects.toThrow('Some error');
+
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          requestId: 'test-request-id',
+          response: expect.objectContaining({
+            finish_reason: 'error',
+            usage: {
+              inputTokens: 10,
+              outputTokens: 2
+            },
+            error: expect.any(Error)
+          })
+        })
+      );
+    });
+
+    it('should keep usage when stream is interrupted with partial response', async () => {
+      const logError = vi
+        .spyOn(getLogger(LogCategories.MODULE.AI.LLM), 'error')
+        .mockImplementation(() => {});
+      const errorChunks = [
+        {
+          choices: [{ delta: { content: 'Hello' }, finish_reason: null }]
+        }
+      ];
+
+      const generator = (async function* () {
+        for (const chunk of errorChunks) {
+          yield chunk;
+        }
+        throw new Error('Stream interrupted');
+      })();
+
+      const mockStreamResponse = Object.assign(generator, {
+        controller: { abort: vi.fn() }
+      }) as unknown as StreamResponseType;
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockStreamResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      let capturedError: any = null;
+      mockParseLLMStreamResponse.mockReturnValue({
+        parsePart: ({ part }: { part: any }) => {
+          return {
+            reasoningContent: '',
+            content: part.choices?.[0]?.delta?.content || '',
+            responseContent: part.choices?.[0]?.delta?.content || '',
+            finishReason: part.choices?.[0]?.finish_reason || null
+          };
+        },
+        getResponseData: () => ({
+          error: capturedError,
+          reasoningContent: '',
+          content: 'Hello',
+          finish_reason: null,
+          usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 }
+        }),
+        updateFinishReason: vi.fn(),
+        updateError: (error: any) => {
+          capturedError = error;
+        }
+      });
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      const result = await createLLMResponse({
+        throwError: false,
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: true
+        }
+      });
+
+      expect(result.answerText).toBe('Hello');
+      expect(result.finish_reason).toBe('error');
+      expect(result.error).toBe(capturedError);
+      expect(result.usage.inputTokens).toBe(5);
+      expect(result.usage.outputTokens).toBe(1);
+      expect(logError).not.toHaveBeenCalled();
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            answerText: 'Hello',
+            finish_reason: 'error',
+            error: expect.any(Error)
+          })
+        })
+      );
+    });
+  });
+
+  describe('Usage calculation', () => {
+    it('should correctly calculate token usage from response', async () => {
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Response text'
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 50,
+          completion_tokens: 30,
+          total_tokens: 80
+        }
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        }
+      });
+
+      expect(result.usage.inputTokens).toBe(50);
+      expect(result.usage.outputTokens).toBe(30);
+    });
+
+    it('should fallback to token counting when usage not provided', async () => {
+      mockCountGptMessagesTokens
+        .mockResolvedValueOnce(45) // Input tokens
+        .mockResolvedValueOnce(25); // Output tokens
+
+      const mockResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Response text'
+            },
+            finish_reason: 'stop'
+          }
+        ]
+        // No usage field
+      };
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(mockResponse)
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Hello' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        }
+      });
+
+      expect(result.usage.inputTokens).toBe(45);
+      expect(result.usage.outputTokens).toBe(25);
+    });
+  });
+
+  describe('Message continuation (length limit)', () => {
+    it.each(
+      (['text', 'reasoning', 'tool'] as const).flatMap((previousOutput) =>
+        (['stop', 'tool_calls'] as const).map((finishReason) => ({
+          previousOutput,
+          finishReason
+        }))
+      )
+    )(
+      'should consider accumulated $previousOutput when the last round is empty with $finishReason',
+      async ({ previousOutput, finishReason }) => {
+        const logError = vi
+          .spyOn(getLogger(LogCategories.MODULE.AI.LLM), 'error')
+          .mockImplementation(() => {});
+        const previousToolCalls: ChatCompletionMessageToolCall[] = [
+          { id: 'call_1', type: 'function', function: { name: 'search', arguments: '{"q":1}' } }
+        ];
+        const create = vi.fn().mockResolvedValueOnce({
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: previousOutput === 'text' ? 'prior answer' : null,
+                reasoning_content: previousOutput === 'reasoning' ? 'prior thought' : undefined,
+                tool_calls: previousOutput === 'tool' ? previousToolCalls : undefined
+              },
+              finish_reason: 'length'
+            }
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+        });
+        create.mockResolvedValueOnce({
+          choices: [
+            {
+              message: { role: 'assistant', content: null, tool_calls: [] },
+              finish_reason: finishReason
+            }
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+        });
+        mockGetAIApi.mockReturnValue(createMockAIApiResult({ chat: { completions: { create } } }));
+
+        const result = await createLLMResponse({
+          throwError: false,
+          maxContinuations: 2,
+          body: {
+            model: createMockModelData(),
+            messages: [{ role: 'user', content: 'Search.' }],
+            tools: [
+              { type: 'function', function: { name: 'search', parameters: { type: 'object' } } }
+            ],
+            stream: false
+          }
+        });
+
+        expect(create).toHaveBeenCalledTimes(2);
+        expect(result.answerText).toBe(previousOutput === 'text' ? 'prior answer' : '');
+        expect(result.reasoningText).toBe(previousOutput === 'reasoning' ? 'prior thought' : '');
+        expect(result.toolCalls ?? []).toEqual(previousOutput === 'tool' ? previousToolCalls : []);
+        expect(result.responseEmptyTip).toBeUndefined();
+        expect(result.usage).toMatchObject({ inputTokens: 20, outputTokens: 4 });
+
+        if (finishReason === 'tool_calls' && previousOutput !== 'tool') {
+          expect(result.finish_reason).toBe('tool_calls');
+          expect(result.error).toBeInstanceOf(Error);
+          expect(result.error.message).toBe(
+            'LLM tool call error: no valid tool calls matched the requested tools.'
+          );
+          expect(logError).toHaveBeenCalledExactlyOnceWith('LLM tool calls missing', {
+            requestBody: expect.any(Object),
+            message: result.error.message
+          });
+        } else {
+          expect(result.finish_reason).toBe(finishReason);
+          expect(result.error).toBeUndefined();
+          expect(logError).not.toHaveBeenCalled();
+        }
+      }
+    );
+
+    it('should continue when finish_reason is length', async () => {
+      const mockResponse1 = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Part 1 of the response...'
+            },
+            finish_reason: 'length'
+          }
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
+      };
+
+      const mockResponse2 = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Part 2 completed.'
+            },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: { prompt_tokens: 35, completion_tokens: 15, total_tokens: 50 }
+      };
+
+      const mockCreate = vi
+        .fn()
+        .mockResolvedValueOnce(mockResponse1)
+        .mockResolvedValueOnce(mockResponse2);
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: mockCreate
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Write a long story' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        },
+        maxContinuations: 5
+      });
+
+      expect(mockCreate).toHaveBeenCalledTimes(2);
+      expect(result.answerText).toBe('Part 1 of the response...Part 2 completed.');
+      expect(result.finish_reason).toBe('stop');
+      expect(result.usage.inputTokens).toBe(45); // 10 + 35
+      expect(result.usage.outputTokens).toBe(35); // 20 + 15
+    });
+
+    it('should respect maxContinuations limit', async () => {
+      const createLengthResponse = (part: number) => ({
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: `Part ${part}...`
+            },
+            finish_reason: 'length'
+          }
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 }
+      });
+
+      const mockCreate = vi.fn().mockResolvedValue(createLengthResponse(1));
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: mockCreate
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const messages: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'Write forever' }
+      ];
+
+      const result = await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages,
+          stream: false
+        },
+        maxContinuations: 3
+      });
+
+      expect(mockCreate).toHaveBeenCalledTimes(3);
+      expect(result.finish_reason).toBe('length');
+    });
+  });
+
+  describe('reasoning_effort handling', () => {
+    const buildOkResponse = () => ({
+      choices: [
+        {
+          message: { role: 'assistant', content: 'ok' },
+          finish_reason: 'stop'
+        }
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+    });
+
+    it('should preserve reasoning_effort when model supports it', async () => {
+      mockGetLLMSupportParams.mockReturnValueOnce({
+        ...defaultSupportParams,
+        reasoning: true,
+        reasoningEffort: true
+      });
+
+      const mockCreate = vi.fn().mockResolvedValue(buildOkResponse());
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult({
+          chat: { completions: { create: mockCreate } }
+        })
+      );
+
+      await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'hi' }],
+          reasoning_effort: 'high',
+          stream: false
+        }
+      });
+
+      expect(mockCreate).toHaveBeenCalledTimes(1);
+      expect(mockCreate.mock.calls[0][0].reasoning_effort).toBe('high');
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestId: 'test-request-id',
+          body: expect.objectContaining({
+            reasoning_effort: 'high'
+          }),
+          response: expect.objectContaining({
+            finish_reason: 'stop'
+          })
+        })
+      );
+    });
+
+    it('should strip reasoning_effort when model does not support it', async () => {
+      mockGetLLMSupportParams.mockReturnValueOnce({
+        ...defaultSupportParams,
+        reasoningEffort: false
+      });
+
+      const mockCreate = vi.fn().mockResolvedValue(buildOkResponse());
+      mockGetAIApi.mockReturnValue(
+        createMockAIApiResult({
+          chat: { completions: { create: mockCreate } }
+        })
+      );
+
+      await createLLMResponse({
+        body: {
+          model: createMockModelData(),
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'hi' }],
+          reasoning_effort: 'high',
+          stream: false
+        }
+      });
+
+      expect(mockCreate).toHaveBeenCalledTimes(1);
+      expect(mockCreate.mock.calls[0][0]).not.toHaveProperty('reasoning_effort');
+      expect(mockSaveLLMRequestRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.not.objectContaining({
+            reasoning_effort: expect.anything()
+          }),
+          response: expect.not.objectContaining({
+            reasoning_effort: expect.anything()
+          })
+        })
+      );
+    });
+  });
+
+  describe('Error handling - requestMessages provenance', () => {
+    it('should return prompt-rewritten requestMessages on API error', async () => {
+      const loaded: ChatCompletionMessageParam[] = [
+        { role: ChatCompletionRequestMessageRoleEnum.System, content: 'sys' },
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'q' }
+      ];
+      const rewritten: ChatCompletionMessageParam[] = [
+        ...loaded,
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'rewritten-suffix' }
+      ];
+
+      mockLoadRequestMessages.mockResolvedValueOnce(loaded as any);
+      mockPromptToolCallMessageRewrite.mockReturnValueOnce(rewritten as any);
+
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockRejectedValue(new Error('boom'))
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const result = await createLLMResponse({
+        throwError: false,
+        body: {
+          model: createMockModelData(),
+          messages: [{ role: ChatCompletionRequestMessageRoleEnum.User, content: 'q' }],
+          tools: [
+            {
+              type: 'function' as const,
+              function: {
+                name: 'noop',
+                description: 'n',
+                parameters: { type: 'object', properties: {} }
+              }
+            }
+          ],
+          toolCallMode: 'prompt',
+          stream: false
+        }
+      });
+
+      expect(result.error).toBeDefined();
+      expect(result.requestMessages).toEqual(rewritten);
+      expect(result.completeMessages).toEqual(rewritten);
+    });
+
+    it('should return normalized requestMessages on API error', async () => {
+      const mockAI = {
+        chat: {
+          completions: {
+            create: vi.fn().mockRejectedValue(new Error('boom'))
+          }
+        }
+      };
+      mockGetAIApi.mockReturnValue(createMockAIApiResult(mockAI));
+
+      const toolCall: ChatCompletionMessageToolCall = {
+        id: 'call_search',
+        type: 'function',
+        function: {
+          name: 'search',
+          arguments: '{"q":"x"}'
+        }
+      };
+
+      const result = await createLLMResponse({
+        throwError: false,
+        body: {
+          model: createMockModelData(),
+          messages: [
+            { role: ChatCompletionRequestMessageRoleEnum.User, content: 'q' },
+            {
+              role: ChatCompletionRequestMessageRoleEnum.Assistant,
+              reasoning_content: 'Need search.'
+            },
+            {
+              role: ChatCompletionRequestMessageRoleEnum.Assistant,
+              tool_calls: [toolCall]
+            }
+          ],
+          stream: false
+        }
+      });
+
+      expect(result.error).toBeDefined();
+      expect(result.requestMessages).toEqual([
+        { role: ChatCompletionRequestMessageRoleEnum.User, content: 'q' },
+        {
+          role: ChatCompletionRequestMessageRoleEnum.Assistant,
+          reasoning_content: 'Need search.',
+          tool_calls: [toolCall]
+        }
+      ]);
+      expect(result.completeMessages).toEqual(result.requestMessages);
+    });
+  });
+});

@@ -1,0 +1,141 @@
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+  CompletionFinishReason
+} from '@fastgpt/global/core/ai/llm/type';
+import type { AgentPlanType } from '@fastgpt/global/core/ai/agent/type';
+import type { AgentAskPayload } from '@fastgpt/global/core/ai/agent/type';
+import type { AgentLoopUsage } from './usage';
+import type { AgentLoopAssistantResponse } from './tool';
+
+export type AgentLoopToolResponseCompress = {
+  response: string;
+  modelName: string;
+  usage: AgentLoopUsage;
+  requestIds: string[];
+  seconds: number;
+};
+
+type AgentLoopPlanOperationEvent = {
+  type: 'plan_operation';
+  operation: 'set_plan' | 'add_steps' | 'update_steps';
+  message: string;
+  id?: string;
+  params?: string;
+  seconds?: number;
+} & (
+  | {
+      success: true;
+      plan: AgentPlanType;
+      error?: never;
+    }
+  | {
+      success: false;
+      plan?: never;
+      error?: unknown;
+    }
+);
+
+export type AgentLoopEvent =
+  | {
+      type: 'user_message';
+      content: string;
+      source: 'server';
+    }
+  | {
+      type: 'llm_request_start';
+      responseId?: string;
+      requestIndex: number;
+      modelName: string;
+    }
+  | {
+      type: 'llm_request_end';
+      responseId?: string;
+      assistantMessage?: ChatCompletionMessageParam;
+      requestIndex: number;
+      modelName: string;
+      requestId: string;
+      finishReason: CompletionFinishReason;
+      answerText?: string;
+      reasoningText?: string;
+      toolCalls?: ChatCompletionMessageToolCall[];
+      usages?: AgentLoopUsage[];
+      firstTokenTime?: number;
+      seconds: number;
+      error?: unknown;
+    }
+  | {
+      type: 'reasoning_delta';
+      text: string;
+    }
+  | {
+      type: 'answer_delta';
+      text: string;
+    }
+  | {
+      type: 'tool_call';
+      call: ChatCompletionMessageToolCall;
+    }
+  | {
+      type: 'tool_params';
+      callId: string;
+      argsDelta: string;
+    }
+  | {
+      /** 内部调用只公开活动信息，不携带参数、响应、错误正文或子工具数据。 */
+      type: 'tool_activity';
+      callId: string;
+      toolName: string;
+      status: 'running' | 'done';
+    }
+  | {
+      type: 'tool_run_start';
+      call: ChatCompletionMessageToolCall;
+    }
+  | {
+      type: 'tool_run_end';
+      resumed?: boolean;
+      internalOnly?: boolean;
+      hideInUI?: boolean;
+      call: ChatCompletionMessageToolCall;
+      /** 实际给模型的完整结果；聊天持久化和 SSE 均使用此值，不再额外裁剪。 */
+      response: string;
+      /** 工具内部产生、需要随本轮 assistant 一起持久化的标准消息。 */
+      assistantMessages?: ChatCompletionMessageParam[];
+      /** 工具内部产生的展示层 assistant responses，由上层 adapter 解释。 */
+      assistantResponses?: AgentLoopAssistantResponse[];
+      errorMessage?: string;
+      seconds: number;
+      usages?: AgentLoopUsage[];
+      toolResponseCompress?: AgentLoopToolResponseCompress;
+      /** executeTool 返回的 opaque metadata，agent-loop 不解释其业务结构。 */
+      metadata?: unknown;
+    }
+  | {
+      type: 'after_message_compress';
+      modelName: string;
+      usages?: AgentLoopUsage[];
+      requestIds: string[];
+      seconds: number;
+      contextCheckpoint?: string;
+    }
+  | {
+      type: 'plan_status';
+      status: 'generating' | 'updating';
+    }
+  | AgentLoopPlanOperationEvent
+  | {
+      type: 'tool_interactive';
+      call: ChatCompletionMessageToolCall;
+      /** 由业务适配层解释的交互结构，Loop 不依赖 workflow schema。 */
+      interactive: unknown;
+    }
+  | {
+      type: 'ask';
+      ask: AgentAskPayload;
+      providerState?: unknown;
+    }
+  | {
+      type: 'ask_resume';
+      answer: string;
+    };

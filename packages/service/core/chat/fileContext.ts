@@ -1,0 +1,637 @@
+import { ChatFileTypeEnum, ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
+import { isChatFileMediaType, isChatFileResolvedType } from '@fastgpt/global/core/chat/file/utils';
+import { isHttpUrl } from '@fastgpt/global/common/string/url';
+import type {
+  ChatItemMiniType,
+  UserChatItemFileItemType,
+  UserChatItemValueItemType
+} from '@fastgpt/global/core/chat/type';
+import { getS3RawTextSource } from '../../common/s3/sources/rawText';
+import { isInternalAddress, PRIVATE_URL_TEXT } from '../../common/system/utils';
+import { S3Buckets } from '../../common/s3/config/constants';
+import { S3Sources } from '../../common/s3/contracts/type';
+import path from 'path';
+import { getFileS3Key } from '../../common/s3/utils';
+import { S3ChatSource } from '../../common/s3/sources/chat';
+import { readFileContentBySource } from '../../common/file/read/utils';
+import { addDays } from 'date-fns';
+import { replaceS3KeyToPreviewUrl } from '../../common/s3/utils/preview';
+import { serviceEnv } from '../../env';
+import { getErrText, UserError } from '@fastgpt/global/common/error/utils';
+import { getUserFilesPrompt, injectUserQueryPrompt } from '../ai/llm/prompt';
+import {
+  S3_ACCESS_LINK_ROUTES,
+  verifyS3DownloadAccess,
+  type VerifiedS3DownloadAccess
+} from '../../common/s3/accessLink';
+import { getFileMaxSize } from '../../common/file/utils';
+import { validateFileUrlDomain } from '../../common/security/fileUrlValidator';
+import { batchRun } from '@fastgpt/global/common/system/utils';
+import type { ChatNodeUsageType } from '@fastgpt/global/support/wallet/bill/type';
+import type { FileSource } from '../../common/file/read/source';
+import { createExternalHttpFileSource, createS3FileSource } from '../../common/file/read/source';
+
+import {
+  prepareChatFiles,
+  parseUrlToChatFileType,
+  validateChatFileInput,
+  type FilePreparationContext
+} from './file/service';
+import { getFileUrlIdentity, isSignedDownloadAlias, selectFileInputs } from './file/utils';
+
+/** Workflow 等上层业务可显式注入的已授权文件读取能力。 */
+export type FileReadContext = FilePreparationContext & {
+  limits?: {
+    maxBytesPerFile: number;
+  };
+  resolve: (url: string) =>
+    | {
+        name: string;
+        type: ChatFileTypeEnum;
+        modelUrl: string;
+      }
+    | undefined;
+  getSource: (url: string) => Promise<{
+    source: FileSource;
+    sourceKind: 'internal' | 'external';
+    imageParsePrefix?: string;
+  }>;
+};
+
+type GetFileProps = {
+  // Pro 子仓库仍会传入该字段；绝对 URL 读取已不依赖请求来源。
+  requestOrigin?: string;
+  maxFiles: number;
+  customPdfParse?: boolean;
+  teamId: string;
+  tmbId: string;
+  usageId?: string;
+  fileContext?: FileReadContext;
+};
+
+/** 从下载 API 或公开短路径提取 signed alias；访问权限仍由后续签名校验或 HTTP 读取判断。 */
+export const resolveSignedDownloadAliasFromUrl = (url: string) => {
+  try {
+    const parsedUrl = new URL(url, 'http://localhost:3000');
+    const routePrefix = `${S3_ACCESS_LINK_ROUTES.download}/`;
+    const routeIndex = parsedUrl.pathname.indexOf(routePrefix);
+
+    const signedAlias = (() => {
+      if (routeIndex >= 0) {
+        return decodeURIComponent(
+          parsedUrl.pathname.slice(routeIndex + routePrefix.length).split('/')[0] || ''
+        );
+      }
+
+      // 支持 FILE_DOWNLOAD_PUBLIC_URL_PREFIX 暴露的 nginx 短路径:
+      //   /{signedAlias}
+      //   /f/{signedAlias}
+      // 这类 URL 的 path 不是文件名，最后一段只有通过短链格式和 HMAC 校验后才可信。
+      const lastPathSegment = parsedUrl.pathname.split('/').filter(Boolean).at(-1) || '';
+      return decodeURIComponent(lastPathSegment);
+    })();
+
+    return isSignedDownloadAlias(signedAlias) ? signedAlias : '';
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * 短链 path 只携带 alias/expiry/signature，不能当作文件名或后缀。
+ * 文件解析需要先把短链还原成真实对象，再用 alias 记录中的 filename/objectKey 推断类型。
+ */
+const resolveShortDownloadAccessFromUrl = async (
+  url: string
+): Promise<VerifiedS3DownloadAccess | undefined> => {
+  const signedAlias = resolveSignedDownloadAliasFromUrl(url);
+  if (!signedAlias) return;
+
+  return verifyS3DownloadAccess(signedAlias);
+};
+
+/** 保留明确分类，unknown 与历史 file 经过统一推测，不能依赖模型提示再次猜测。 */
+const resolveUserFileItem = async (file: UserChatItemFileItemType) => {
+  if (isChatFileResolvedType(file.type)) return file;
+
+  const parsed = await parseUrlToChatFileType({
+    url: file.url,
+    name: file.name,
+    type: file.type
+  });
+  if (!parsed) return { ...file, type: ChatFileTypeEnum.unknown };
+  if (parsed.type === file.type) return file;
+
+  return {
+    ...file,
+    type: parsed.type,
+    name: file.name || parsed.filename || file.url
+  };
+};
+
+const resolveFilesInUserQuery = async (userQuery: UserChatItemValueItemType[]) => {
+  let changed = false;
+
+  const normalizedUserQuery = await Promise.all(
+    userQuery.map(async (item) => {
+      if (!item.file) return item;
+
+      const file = await resolveUserFileItem(item.file);
+      if (file === item.file) return item;
+
+      changed = true;
+      return {
+        ...item,
+        file
+      };
+    })
+  );
+
+  return changed ? normalizedUserQuery : userQuery;
+};
+
+type ParsedFileItem = {
+  name: string;
+  url: string;
+  sandboxPath?: string;
+  content?: string;
+};
+
+type ParseFileFn = (urls: string[]) => Promise<ParsedFileItem[]>;
+
+/** 归一化文档与未知文件类型，并按 URL 去除同一条消息中的重复文件。 */
+const prepareAIChatUserQueryFiles = async (userQuery: UserChatItemValueItemType[]) => {
+  const normalizedUserQuery = await resolveFilesInUserQuery(userQuery);
+  const seenFileUrls = new Set<string>();
+  const filteredUserQuery = normalizedUserQuery.filter((item) => {
+    if (!item.file) return true;
+    if (seenFileUrls.has(item.file.url)) return false;
+
+    seenFileUrls.add(item.file.url);
+    return true;
+  });
+  const deduplicatedUserQuery =
+    filteredUserQuery.length === normalizedUserQuery.length
+      ? normalizedUserQuery
+      : filteredUserQuery;
+
+  return deduplicatedUserQuery;
+};
+
+const getAIChatDocumentUrls = (userQuery: UserChatItemValueItemType[]) =>
+  userQuery
+    .map((item) => (item.file?.type === ChatFileTypeEnum.document ? item.file.url : ''))
+    .filter(Boolean);
+
+/** 将已经解析的文件正文合并进单条 Human 消息。 */
+const mergeAIChatUserQueryWithFiles = ({
+  userQuery,
+  readFilesResult
+}: {
+  userQuery: UserChatItemValueItemType[];
+  readFilesResult: ParsedFileItem[];
+}): UserChatItemValueItemType[] => {
+  if (readFilesResult.length === 0) {
+    return userQuery;
+  }
+
+  // AI Chat 会把普通文档合并到文本上下文，多模态文件仍作为独立输入发给模型。
+  const text = userQuery.find((item) => item.text?.content)?.text?.content;
+  const fileQuery = getUserFilesPrompt(readFilesResult);
+
+  const finalQuery = injectUserQueryPrompt({
+    query: text,
+    filePrompt: fileQuery
+  });
+
+  const multimodalItems = userQuery.filter(
+    (item) => !item.text && item.file?.type !== ChatFileTypeEnum.document
+  );
+
+  return [
+    ...multimodalItems,
+    {
+      text: {
+        content: finalQuery
+      }
+    }
+  ];
+};
+
+export const formatAIChatUserQueryWithFiles = async ({
+  userQuery,
+  parseFileFn
+}: {
+  userQuery: UserChatItemValueItemType[];
+  parseFileFn: ParseFileFn;
+}): Promise<UserChatItemValueItemType[]> => {
+  const preparedUserQuery = await prepareAIChatUserQueryFiles(userQuery);
+  const urls = getAIChatDocumentUrls(preparedUserQuery);
+
+  if (urls.length === 0) {
+    return preparedUserQuery;
+  }
+
+  const readFilesResult = await parseFileFn(urls);
+  return mergeAIChatUserQueryWithFiles({ userQuery: preparedUserQuery, readFilesResult });
+};
+
+/**
+ * 在发送给 LLM 前把 Human 消息里的普通文件解析为文本上下文。
+ *
+ * 历史 Human 消息是否解析由调用方控制；未解析时会移除历史文件项，避免旧文件继续作为模型文件输入。
+ */
+export const rewriteChatMessagesWithFileContext = async ({
+  messages,
+  parseHistoryFiles,
+  maxFiles,
+  parseFileFn
+}: {
+  messages: ChatItemMiniType[];
+  parseHistoryFiles: boolean;
+  maxFiles?: number;
+  parseFileFn: ParseFileFn;
+}) => {
+  const fileLimit = Math.max(0, Math.floor(maxFiles ?? Number.MAX_SAFE_INTEGER));
+  const preparedMessages = await Promise.all(
+    messages.map(async (message, index): Promise<ChatItemMiniType> => {
+      if (message.obj !== ChatRoleEnum.Human) {
+        return message;
+      }
+
+      const isCurrentUserMessage = index === messages.length - 1;
+      if (!isCurrentUserMessage && !parseHistoryFiles) {
+        return {
+          ...message,
+          value: message.value.filter((item) => !item.file)
+        };
+      }
+
+      return {
+        ...message,
+        value: await prepareAIChatUserQueryFiles(message.value)
+      };
+    })
+  );
+
+  const messageFileUrls = preparedMessages.map((message) =>
+    message.obj === ChatRoleEnum.Human
+      ? getAIChatDocumentUrls(message.value).slice(0, fileLimit)
+      : []
+  );
+  const uniqueFileUrls = Array.from(new Set(messageFileUrls.flat()));
+  const parsedFiles = uniqueFileUrls.length > 0 ? await parseFileFn(uniqueFileUrls) : [];
+  const parsedFileMap = new Map(parsedFiles.map((file) => [file.url, file]));
+
+  return preparedMessages.map((message, index) => {
+    if (message.obj !== ChatRoleEnum.Human) return message;
+
+    const readFilesResult = messageFileUrls[index]
+      .map((url) => parsedFileMap.get(url))
+      .filter((file): file is ParsedFileItem => file !== undefined);
+
+    return {
+      ...message,
+      value: mergeAIChatUserQueryWithFiles({ userQuery: message.value, readFilesResult })
+    };
+  });
+};
+
+/**
+ * 将已授权引用或绝对 HTTP(S) URL 归一化为文档读取候选，排除明确的多模态文件。
+ * 显式读取仍允许 unknown，由下载响应和解析器判断格式，避免无后缀链接在 HEAD 探测失败后无法读取。
+ */
+export const normalizeReadableFileUrl = async ({
+  url,
+  fileContext
+}: {
+  url?: string;
+  fileContext?: FileReadContext;
+}): Promise<string> => {
+  if (typeof url !== 'string' || !url.trim()) return '';
+  const normalizedUrl = url.trim();
+
+  // 调试续跑或直接调试解析节点时，短链可能尚未登记。先校验签名并用真实对象元数据分类，
+  // 避免把短链 token 当成带后缀的外链登记，遮蔽后续的 S3 文件读取路径。
+  if (
+    !fileContext?.resolveChatFile(normalizedUrl) &&
+    resolveSignedDownloadAliasFromUrl(normalizedUrl)
+  ) {
+    if (!validateChatFileInput({ url: normalizedUrl, fileContext })) return '';
+    const access = await resolveShortDownloadAccessFromUrl(normalizedUrl);
+    if (access) {
+      const file = await parseUrlToChatFileType({
+        url: access.objectKey,
+        metadata: { filename: access.filename, contentType: access.responseContentType }
+      });
+      return file && !isChatFileMediaType(file.type) ? normalizedUrl : '';
+    }
+  }
+
+  const [file] = await prepareChatFiles({
+    files: [{ url: normalizedUrl }],
+    maxFiles: 1,
+    fileContext
+  });
+  return file && !isChatFileMediaType(file.type) ? file.url : '';
+};
+
+/**
+ * 在查询解析缓存前确认文件引用可读。
+ *
+ * 已登记文件已由上层 Context 完成授权；未登记 URL 作为动态外链处理，必须先通过
+ * HTTP(S)、域名白名单和内部地址检查，避免缓存命中绕过当前请求的出站策略。
+ */
+const getAuthorizedFileCacheSourceId = async ({
+  url,
+  fileContext,
+  validateExternalUrlDomain = true
+}: {
+  url: string;
+  fileContext?: FileReadContext;
+  validateExternalUrlDomain?: boolean;
+}) => {
+  const fileRef = fileContext?.resolve(url);
+  if (fileRef) return fileContext?.getIdentity(url) ?? fileRef.modelUrl;
+
+  if (!isHttpUrl(url)) {
+    throw new UserError('File URL must be an absolute HTTP(S) URL');
+  }
+
+  const parsedUrl = new URL(url);
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new UserError('File URL must use HTTP(S)');
+  }
+  if (fileContext && validateExternalUrlDomain && !validateFileUrlDomain(url)) {
+    throw new UserError('Invalid file URL domain');
+  }
+  if (await isInternalAddress(url)) {
+    throw new UserError(PRIVATE_URL_TEXT);
+  }
+
+  return url;
+};
+
+export const getFileInfoFromUrl = async ({
+  teamId,
+  url,
+  fileContext
+}: {
+  teamId: string;
+  url: string;
+  fileContext?: FileReadContext;
+}) => {
+  const fileRef = fileContext?.resolve(url);
+  if (fileRef && fileContext) {
+    const { source, sourceKind, imageParsePrefix } = await fileContext.getSource(url);
+    const isChatExternalUrl = sourceKind === 'external';
+    const resolvedFilename = source.metadata.filename || fileRef.name;
+
+    return {
+      isChatExternalUrl,
+      filename: resolvedFilename,
+      imageParsePrefix: isChatExternalUrl
+        ? getFileS3Key.temp({ teamId, filename: resolvedFilename }).fileParsedPrefix
+        : imageParsePrefix || '',
+      source
+    };
+  }
+
+  if (!isHttpUrl(url)) {
+    throw new UserError('File URL must be an absolute HTTP(S) URL');
+  }
+  const parsedUrl = new URL(url);
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new UserError('File URL must use HTTP(S)');
+  }
+
+  const shortDownloadAccess = await resolveShortDownloadAccessFromUrl(url);
+  const urlObj = new URL(url, 'http://localhost:3000');
+  const isShortChatFile =
+    shortDownloadAccess?.bucketName === S3Buckets.private &&
+    shortDownloadAccess.objectKey.startsWith(`${S3Sources.chat}/`);
+  const isChatExternalUrl =
+    !isShortChatFile && !urlObj.pathname.startsWith(`/${S3Buckets.private}/${S3Sources.chat}/`);
+
+  // Get file name
+  const { filename, imageParsePrefix } = (() => {
+    if (isShortChatFile && shortDownloadAccess) {
+      const parsedChatUrl = S3ChatSource.parseChatUrl(
+        new URL(
+          `/${shortDownloadAccess.bucketName}/${shortDownloadAccess.objectKey}`,
+          'http://localhost:3000'
+        )
+      );
+      const filename =
+        shortDownloadAccess.filename ||
+        parsedChatUrl.filename ||
+        path.basename(shortDownloadAccess.objectKey);
+
+      return {
+        filename,
+        imageParsePrefix: parsedChatUrl.imageParsePrefix
+      };
+    }
+
+    if (isChatExternalUrl) {
+      const filename =
+        shortDownloadAccess?.filename ||
+        (shortDownloadAccess?.objectKey ? path.basename(shortDownloadAccess.objectKey) : '') ||
+        urlObj.pathname.split('/').pop() ||
+        'file';
+
+      return {
+        filename,
+        imageParsePrefix: getFileS3Key.temp({ teamId, filename }).fileParsedPrefix
+      };
+    }
+
+    return S3ChatSource.parseChatUrl(url);
+  })();
+
+  if (isShortChatFile && shortDownloadAccess) {
+    const bucket = global.s3BucketMap?.[S3Buckets.private];
+    if (!bucket) throw new Error('Private S3 bucket is not initialized');
+    const metadata = await bucket.client.getObjectMetadata({
+      key: shortDownloadAccess.objectKey
+    });
+    const sizeBytes = metadata?.contentLength;
+    if (typeof sizeBytes !== 'number' || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0) {
+      throw new Error('Chat file object has invalid metadata');
+    }
+
+    return {
+      isChatExternalUrl: false,
+      filename,
+      imageParsePrefix,
+      source: createS3FileSource({
+        sizeBytes,
+        metadata: {
+          filename,
+          contentType: shortDownloadAccess.responseContentType || metadata.contentType
+        },
+        getStream: async (signal) => {
+          const response = await bucket.client.downloadObject({
+            key: shortDownloadAccess.objectKey,
+            abortSignal: signal
+          });
+          if (!response.body) throw new Error('Chat file object has no body');
+          return response.body;
+        }
+      })
+    };
+  }
+
+  return {
+    isChatExternalUrl,
+    filename,
+    imageParsePrefix,
+    source: createExternalHttpFileSource({
+      url,
+      maxSizeBytes: fileContext?.limits?.maxBytesPerFile ?? getFileMaxSize(),
+      trustMetadataFilename: Boolean(shortDownloadAccess?.filename),
+      metadata: {
+        filename,
+        contentType: shortDownloadAccess?.responseContentType
+      }
+    })
+  };
+};
+
+export const getFileContentByUrl = async ({
+  url,
+  teamId,
+  tmbId,
+  customPdfParse,
+  usageId,
+  fileContext,
+  validateExternalUrlDomain,
+  onPdfParseUsage
+}: {
+  url: string;
+  teamId: string;
+  tmbId: string;
+  customPdfParse?: boolean;
+  usageId?: string;
+  fileContext?: FileReadContext;
+  /** 工作流工具可接管 PDF 增强解析费用，使其归属具体 read_files 节点。 */
+  onPdfParseUsage?: (usage: ChatNodeUsageType) => void;
+  /** 动态工具 URL 可跳过上传文件域名白名单，底层仍执行 HTTP(S)、SSRF 和大小校验。 */
+  validateExternalUrlDomain?: boolean;
+}) => {
+  const sourceId = await getAuthorizedFileCacheSourceId({
+    url,
+    fileContext,
+    validateExternalUrlDomain
+  });
+  // Get from buffer
+  const rawTextBuffer = await getS3RawTextSource().getRawTextBuffer({
+    sourceId,
+    customPdfParse
+  });
+  if (rawTextBuffer) {
+    return {
+      name: rawTextBuffer.filename,
+      url,
+      content: rawTextBuffer.text
+    };
+  }
+
+  const { isChatExternalUrl, filename, imageParsePrefix, source } = await getFileInfoFromUrl({
+    teamId,
+    url,
+    fileContext
+  });
+
+  const { rawText, sourceMetadata } = await readFileContentBySource({
+    source,
+    teamId,
+    tmbId,
+    customPdfParse,
+    getFormatText: true,
+    imageKeyOptions: imageParsePrefix
+      ? {
+          prefix: imageParsePrefix,
+          // 聊天对话里面上传的外部链接，解析出来的图片过期时间设置为1天，而且是存储在临时文件夹的
+          expiredTime: isChatExternalUrl ? addDays(new Date(), 1) : undefined
+        }
+      : undefined,
+    usageId,
+    onPdfParseUsage
+  });
+
+  const replacedText = await replaceS3KeyToPreviewUrl(
+    rawText,
+    addDays(new Date(), serviceEnv.FILE_URL_EXPIRED_DAYS)
+  );
+  const resolvedFilename = sourceMetadata?.filename || filename;
+
+  // Add to buffer
+  getS3RawTextSource().addRawTextBuffer({
+    sourceId,
+    sourceName: resolvedFilename,
+    text: replacedText,
+    customPdfParse
+  });
+
+  return {
+    name: resolvedFilename,
+    url,
+    content: replacedText
+  };
+};
+export const parseFileContentFromUrls = async ({
+  urls,
+  maxFiles,
+  teamId,
+  tmbId,
+  customPdfParse,
+  usageId,
+  fileContext
+}: GetFileProps & {
+  urls: string[];
+}): Promise<
+  {
+    success: boolean;
+    name: string;
+    url: string;
+    content: string;
+  }[]
+> => {
+  // 空链接不占额度；数量上限同时约束探测和正文读取，超限文件不产生任何网络请求。
+  const candidateUrls = selectFileInputs({
+    files: urls.filter((url) => url.trim()),
+    maxFiles,
+    getIdentity: (url) => fileContext?.getIdentity(url.trim()) ?? getFileUrlIdentity(url.trim())
+  });
+
+  const readFilesResult = await batchRun(
+    candidateUrls,
+    async (inputUrl) => {
+      try {
+        const url = await normalizeReadableFileUrl({ url: inputUrl, fileContext });
+        if (!url) return;
+        const { name, content } = await getFileContentByUrl({
+          url,
+          teamId,
+          tmbId,
+          customPdfParse,
+          usageId,
+          fileContext
+        });
+
+        return { success: true, name, url, content };
+      } catch (error) {
+        return {
+          success: false,
+          name: '',
+          url: inputUrl,
+          content: getErrText(error, 'Load file error')
+        };
+      }
+    },
+    5
+  );
+
+  return readFilesResult.filter((file): file is NonNullable<typeof file> => file !== undefined);
+};

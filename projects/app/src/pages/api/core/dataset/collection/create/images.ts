@@ -1,0 +1,137 @@
+import { getFileUploadLimits } from '@fastgpt/global/common/file/limit';
+import { NextAPI } from '@/service/middleware/entry';
+import { datasetImageCollectionFileType } from '@fastgpt/global/common/file/constants';
+import { i18nT } from '@fastgpt/global/common/i18n/utils';
+import {
+  DatasetCollectionDataProcessModeEnum,
+  DatasetCollectionTypeEnum
+} from '@fastgpt/global/core/dataset/constants';
+import {
+  CreateImageCollectionFormSchema,
+  type CreateCollectionWithResultResponseType
+} from '@fastgpt/global/openapi/core/dataset/collection/createApi';
+import { type ApiRequestProps } from '@fastgpt/next/type';
+import { multer } from '@fastgpt/service/common/file/multer';
+import { decodeMultipartFilename } from '@fastgpt/service/common/s3/filename';
+import { getFileS3Key, uploadImage2S3Bucket } from '@fastgpt/service/common/s3/utils';
+import { parseAllowedExtensions } from '@fastgpt/service/common/s3/utils/uploadConstraints';
+import { validateUploadFile } from '@fastgpt/service/common/s3/validation/upload';
+import { getTeamModelHandle } from '@fastgpt/service/core/ai/model/catalog/service';
+import { createCollectionAndInsertData } from '@fastgpt/service/core/dataset/collection/controller';
+import { getDatasetModelReference } from '@fastgpt/service/core/dataset/model';
+import { authDatasetCollectionCreate } from '@fastgpt/service/support/permission/dataset/auth';
+import { checkDatasetIndexLimit } from '@fastgpt/service/support/permission/teamLimit';
+import { addDays } from 'date-fns';
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { assertUploadRateLimit } from '@fastgpt/service/common/rateLimit/interface/upload';
+import { getDatasetImageIndexCapability } from '@fastgpt/service/core/dataset/utils';
+import { getTeamPlanStatus } from '@fastgpt/service/support/wallet/sub/utils';
+
+async function handler(req: ApiRequestProps): Promise<CreateCollectionWithResultResponseType> {
+  const filepaths: string[] = [];
+
+  try {
+    const result = await multer.resolveMultipleFormData({
+      request: req,
+      maxFileSize: global.feConfigs.limit.uploadFileMaxSize,
+      allowedExtensions: parseAllowedExtensions(datasetImageCollectionFileType)
+    });
+    filepaths.push(...result.fileMetadata.map((item) => item.path));
+    const { parentId, datasetId, collectionName, tags } = CreateImageCollectionFormSchema.parse(
+      result.data
+    );
+
+    const { dataset, teamId, tmbId } = await authDatasetCollectionCreate({
+      datasetId,
+      parentId,
+      req,
+      authToken: true,
+      authApiKey: true
+    });
+
+    // Check dataset limit
+    await checkDatasetIndexLimit({
+      teamId,
+      insertLen: 1
+    });
+
+    const planStatus = await getTeamPlanStatus({ teamId });
+    const uploadLimits = getFileUploadLimits({
+      teamPlan: planStatus.standard,
+      systemLimit: global.feConfigs.limit
+    });
+    await assertUploadRateLimit({
+      identity: String(tmbId),
+      limit: uploadLimits.maxUploadFileCount,
+      increment: result.fileMetadata.length
+    });
+    const modelHandle = await getTeamModelHandle({ teamId });
+    const { supportVlm, supportImageEmbedding } = getDatasetImageIndexCapability({
+      vectorModel: modelHandle.getModelData(getDatasetModelReference(dataset, 'embedding'), {
+        type: 'embedding'
+      }),
+      vlmModel: modelHandle.getModelData(getDatasetModelReference(dataset, 'vlm'), {
+        type: 'llm',
+        vision: true,
+        optional: true
+      })
+    });
+
+    if (!supportVlm && !supportImageEmbedding) {
+      return Promise.reject(i18nT('file:Image_dataset_requires_VLM_model_to_be_configured'));
+    }
+
+    const imageIds = await Promise.all(
+      result.fileMetadata.map(async (file) => {
+        const buffer = await fs.promises.readFile(file.path);
+        const filename = path.basename(decodeMultipartFilename(file.originalname || file.filename));
+        const { contentType: mimetype, filename: resolvedFilename } = await validateUploadFile({
+          buffer,
+          filename,
+          uploadConstraints: {
+            allowedExtensions: parseAllowedExtensions(datasetImageCollectionFileType)
+          }
+        });
+        const { fileKey } = getFileS3Key.dataset({ datasetId, filename: resolvedFilename });
+        return uploadImage2S3Bucket('private', {
+          buffer,
+          uploadKey: fileKey,
+          mimetype,
+          filename: resolvedFilename,
+          expiredTime: addDays(new Date(), 7)
+        });
+      })
+    );
+
+    return createCollectionAndInsertData({
+      dataset,
+      imageIds,
+      createCollectionParams: {
+        parentId,
+        teamId,
+        tmbId,
+        datasetId,
+        type: DatasetCollectionTypeEnum.images,
+        name: collectionName,
+        tags,
+        trainingType: supportVlm
+          ? DatasetCollectionDataProcessModeEnum.imageParse
+          : DatasetCollectionDataProcessModeEnum.chunk
+      }
+    });
+  } catch (error) {
+    return Promise.reject(error);
+  } finally {
+    multer.clearDiskTempFiles(filepaths);
+  }
+}
+
+export default NextAPI(handler);
+
+export const config = {
+  api: {
+    bodyParser: false
+  }
+};

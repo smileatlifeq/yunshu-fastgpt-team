@@ -1,0 +1,32 @@
+---
+title: Configuration Panel
+description: Configure prompts, the virtual machine, and Skills in Chat Agent V2.
+---
+
+Use the Configuration Panel to set your Agent's instructions, runtime environment, and Skills.
+
+![Agent configuration panel with prompt, virtual machine, and Skill settings](/imgs/agent_settings_panel.png)
+
+---
+
+## AI Configuration & Virtual Machine
+
+**Prompt:** Define the Agent's persona, goals, and rules. The editor supports rich text. Type `@` to select and bind supported tools and other context.
+
+| Tool Binding | Rich Text Editing |
+| :---: | :---: |
+| ![Type @ in the prompt editor to select a tool](/imgs/agent_prompt_editor_at.png) | ![Edit and format the Agent prompt](/imgs/agent_prompt_editor_mention.png) |
+
+For shared model settings, including the chat model, response length, and reasoning display, see [AI Settings](/en/guide/build/general/ai_settings).
+
+**Virtual Machine:** Enable the virtual machine to give each session its own Linux sandbox for running code, reading and writing files, and running startup scripts. See [Virtual Machine](/en/guide/build/agentv2/vm) for its design and debugging tools, and [Virtual Machine Lifecycle](/en/guide/build/agentv2/vm#virtual-machine-lifecycle) for startup-script deduplication and execution details.
+
+---
+
+## Associate SKILL & Tools
+
+Select the published Skill packages the Agent should use. Each Skill's entrypoint script runs automatically when the virtual machine starts.
+
+Enable the virtual machine before using an associated Skill. Otherwise, the configuration panel displays a **Virtual Machine Not Ready** warning. For instructions on writing and packaging Skills, see [Development & Debugging](/en/guide/build/skill/development).
+
+![Virtual Machine Not Ready warning for an associated Skill](/imgs/agent_skill_vm_not_ready.png)

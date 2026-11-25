@@ -1,0 +1,36 @@
+---
+title: Variable Update
+description: FastGPT Variable Update node overview
+---
+
+## Features
+
+- Can be added multiple times
+- Has external inputs
+- Trigger-based execution
+- Manual configuration
+
+![Variable Update node in a Workflow](/imgs/variable_update1.png)
+
+## Function
+
+Choose the node output or global variable to update, and provide its new value. Place the Variable Update node before the downstream nodes that need that value.
+
+- Update the output value of a specified node
+
+![Select a node output to update](/imgs/variable_update2.png)
+
+![Configure the replacement output value](/imgs/variable_update3.png)
+
+- Update global variables
+
+![Select a global variable to update](/imgs/variable_update4.png)
+
+![Configure the new global variable value](/imgs/variable_update5.png)
+
+## Use Cases
+
+Common scenarios include:
+
+- Assign a value to a "Custom Variable" type global variable, so the global variable doesn't require user input
+- Update a workflow node's output upstream of the Variable Update node, so downstream nodes use the new value

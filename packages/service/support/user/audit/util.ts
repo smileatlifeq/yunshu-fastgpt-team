@@ -1,0 +1,147 @@
+import { AppTypeEnum } from '@fastgpt/global/core/app/constants';
+import { DatasetTypeEnum } from '@fastgpt/global/core/dataset/constants';
+import { AgentSkillTypeEnum } from '@fastgpt/global/core/ai/skill/constants';
+import { i18nT } from '@fastgpt/global/common/i18n/utils';
+import { MongoTeamAudit } from './schema';
+import { getLogger, LogCategories } from '../../../common/logger';
+import type {
+  AdminAuditEventEnum,
+  AuditEventEnum,
+  AdminAuditEventParamsType,
+  AuditEventParamsType,
+  DatasetAuditEvent,
+  DatasetAuditEventParamsType,
+  TeamAuditEvent
+} from '@fastgpt/global/support/user/audit/constants';
+import type { DatasetAuditEventEnum } from '@fastgpt/global/core/dataset/audit/constants/event';
+import { retryFn } from '@fastgpt/global/common/system/utils';
+import type { AuditResourceType } from '@fastgpt/global/support/user/audit/type';
+
+const logger = getLogger(LogCategories.INFRA.MONGO);
+
+export type AuditLogInput = {
+  tmbId: string;
+  teamId: string;
+  event: TeamAuditEvent | AdminAuditEventEnum;
+  resources?: AuditResourceType[];
+  params?: Record<string, unknown>;
+};
+
+type AddAuditLogInput<T, P> = {
+  teamId: string;
+  event: T;
+  resources?: AuditResourceType[];
+  params?: P;
+} & (
+  | {
+      tmbId: string;
+      scope?: 'member';
+    }
+  | {
+      tmbId?: never;
+      scope: 'system';
+    }
+);
+
+export function getI18nAppType(type: AppTypeEnum): string {
+  if (type === AppTypeEnum.folder) return i18nT('account_team:type.Folder');
+  if (type === AppTypeEnum.simple) return i18nT('app:type.Chat_Agent');
+  if (type === AppTypeEnum.chatAgent) return 'Agent';
+  if (type === AppTypeEnum.workflow) return i18nT('account_team:type.Workflow bot');
+  if (type === AppTypeEnum.workflowTool) return i18nT('app:toolType_workflow');
+  if (type === AppTypeEnum.httpPlugin) return i18nT('account_team:type.Http plugin');
+  if (type === AppTypeEnum.httpToolSet) return i18nT('app:toolType_http');
+  if (type === AppTypeEnum.mcpToolSet) return i18nT('app:toolType_mcp');
+  if (type === AppTypeEnum.tool) return i18nT('app:toolType_mcp');
+  return i18nT('common:UnKnow');
+}
+
+export function getI18nCollaboratorItemType(
+  tmbId: string | undefined,
+  groupId: string | undefined,
+  orgId: string | undefined
+): string {
+  if (tmbId) return i18nT('account_team:member');
+  if (groupId) return i18nT('account_team:group');
+  if (orgId) return i18nT('account_team:department');
+  return i18nT('common:UnKnow');
+}
+
+export function getI18nDatasetType(type: DatasetTypeEnum | string): string {
+  if (type === DatasetTypeEnum.folder) return i18nT('account_team:dataset.folder_dataset');
+  if (type === DatasetTypeEnum.dataset) return i18nT('account_team:dataset.common_dataset');
+  if (type === DatasetTypeEnum.websiteDataset) return i18nT('account_team:dataset.website_dataset');
+  if (type === DatasetTypeEnum.externalFile) return i18nT('account_team:dataset.external_file');
+  if (type === DatasetTypeEnum.apiDataset) return i18nT('account_team:dataset.api_file');
+  if (type === DatasetTypeEnum.feishu) return i18nT('account_team:dataset.feishu_dataset');
+  if (type === DatasetTypeEnum.yuque) return i18nT('account_team:dataset.yuque_dataset');
+  if (type === DatasetTypeEnum.dingtalk) return i18nT('account_team:dataset.dingtalk_dataset');
+  return i18nT('common:UnKnow');
+}
+
+export function getI18nSkillType(type: AgentSkillTypeEnum | string): string {
+  if (type === AgentSkillTypeEnum.folder) return i18nT('account_team:skill.folder');
+  if (type === AgentSkillTypeEnum.skill) return i18nT('account_team:skill.skill');
+  return i18nT('common:UnKnow');
+}
+
+export function getI18nInformLevel(level: string): string {
+  if (level === 'common') return i18nT('account_team:inform_level_common');
+  if (level === 'important') return i18nT('account_team:inform_level_important');
+  if (level === 'emergency') return i18nT('account_team:inform_level_emergency');
+  return i18nT('common:UnKnow');
+}
+
+/** 写入审计及可选资源关联，内部重试并记录最终失败；member 作用域必须提供 tmbId。 */
+export function addAuditLog<T extends AuditEventEnum>(
+  input: AddAuditLogInput<T, AuditEventParamsType[T]>
+): Promise<void>;
+
+export function addAuditLog<T extends AdminAuditEventEnum>(
+  input: AddAuditLogInput<T, AdminAuditEventParamsType[T]>
+): Promise<void>;
+
+/** 知识库事件：事件名取 DatasetAuditEventEnum 的点分 value，参数类型按 DatasetAuditEventParamsType 校验。 */
+export function addAuditLog<T extends DatasetAuditEventEnum>(
+  input: AddAuditLogInput<T, DatasetAuditEventParamsType[T]>
+): Promise<void>;
+
+export function addAuditLog<T extends AuditEventEnum | AdminAuditEventEnum | DatasetAuditEvent>(
+  input: AddAuditLogInput<T, any>
+): Promise<void> {
+  const { teamId, tmbId, scope, event, resources, params } = input;
+
+  return retryFn(async () => {
+    await MongoTeamAudit.create({
+      ...(scope === 'system' ? { scope } : { ...(scope ? { scope } : {}), tmbId }),
+      teamId,
+      event,
+      ...(resources ? { resources } : {}),
+      metadata: params
+    });
+  }).catch((error) => {
+    logger.error('Audit log write failed', { error, teamId, tmbId, scope, event });
+  });
+}
+
+/** 批量写入审计日志，保留每个变更对象一条日志的展示粒度。 */
+export const addAuditLogs = async (logs: AuditLogInput[]): Promise<void> => {
+  if (logs.length === 0) return;
+
+  try {
+    await retryFn(async () => {
+      await MongoTeamAudit.insertMany(
+        logs.map(({ tmbId, teamId, event, resources, params }) => ({
+          tmbId,
+          teamId,
+          event,
+          ...(resources ? { resources } : {}),
+          metadata: params
+        })),
+        { ordered: true }
+      );
+    });
+  } catch (error) {
+    logger.error('Batch audit log write failed', { error, count: logs.length });
+  }
+};

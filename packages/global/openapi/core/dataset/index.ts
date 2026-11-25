@@ -1,0 +1,445 @@
+import type { OpenAPIPath } from '../../type';
+import { DevApiTagsMap } from '../../tag';
+import { SystemOpenApiTagMap } from '../../tag';
+import { DatasetDataPath } from './data';
+import { DatasetCollectionPath } from './collection';
+import { ApiDatasetPath } from './apiDataset';
+import { DatasetTagPath } from './tag';
+import { DatasetFilePath } from './file';
+import { DatasetTrainingPath } from './training';
+import { DatasetSynonymPath } from './synonym';
+import { DatasetBatchPath } from './batch';
+import {
+  CreateDatasetBodySchema,
+  CreateDatasetWithFilesBodySchema,
+  DeleteDatasetQuerySchema,
+  GetDatasetDetailQuerySchema,
+  GetDatasetDetailResponseSchema,
+  GetDatasetListBodySchema,
+  GetDatasetListResponseSchema,
+  GetDatasetListV2BodySchema,
+  GetDatasetListV2ResponseSchema,
+  GetDatasetPathsQuerySchema,
+  UpdateDatasetBodySchema,
+  ResumeDatasetInheritPermissionBodySchema,
+  EnableCollectionPermissionBodySchema,
+  EnableCollectionPermissionResponseSchema,
+  DisableCollectionPermissionBodySchema,
+  DisableCollectionPermissionResponseSchema,
+  CreateDatasetFolderBodySchema,
+  SearchDatasetTestBodySchema,
+  SearchDatasetTestResponseSchema,
+  ExportDatasetQuerySchema,
+  GetDatasetPermissionQuerySchema,
+  ChangeDatasetOwnerBodySchema,
+  ChangeDatasetOwnerResponseSchema,
+  GetDatasetCollaboratorListQuerySchema,
+  GetDatasetCollaboratorListResponseSchema,
+  UpdateDatasetCollaboratorBodySchema,
+  UpdateDatasetCollaboratorResponseSchema,
+  PostDatasetSyncBodySchema
+} from './api';
+
+export const DatasetPath: OpenAPIPath = {
+  '/core/dataset/create': {
+    post: {
+      summary: '创建知识库',
+      description: '创建新的知识库,支持多种类型(普通知识库、文件夹、网站知识库等)',
+      tags: [DevApiTagsMap.datasetCommon, SystemOpenApiTagMap.dataset],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: CreateDatasetBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功返回新创建的知识库 ID'
+        }
+      }
+    }
+  },
+  '/core/dataset/createWithFiles': {
+    post: {
+      summary: '创建知识库并上传文件',
+      description: '一步完成知识库创建和文件上传,自动创建集合并开始数据处理',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: CreateDatasetWithFilesBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功返回知识库信息和向量模型配置'
+        }
+      }
+    }
+  },
+  '/core/dataset/folder/create': {
+    post: {
+      summary: '创建知识库文件夹',
+      description: '创建知识库文件夹,用于组织和管理知识库',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: CreateDatasetFolderBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功创建文件夹'
+        }
+      }
+    }
+  },
+  '/core/dataset/list': {
+    post: {
+      deprecated: true,
+      summary: '获取知识库列表',
+      description:
+        '已弃用，请使用 POST /core/dataset/listV2。旧接口保留兼容，返回当前用户有权限访问的知识库数组，支持按类型和关键词筛选；V2 返回分页结构 { list, total }',
+      tags: [DevApiTagsMap.datasetCommon, SystemOpenApiTagMap.dataset],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: GetDatasetListBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功返回知识库列表',
+          content: {
+            'application/json': {
+              schema: GetDatasetListResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/core/dataset/listV2': {
+    post: {
+      summary: '获取知识库列表 V2',
+      description:
+        '分页获取或按 datasetIds 精确查询当前用户有权限访问的知识库；提供 datasetIds 时优先按 ID 查询，解析时过滤 parentId 和分页参数，保留公共筛选字段',
+      tags: [DevApiTagsMap.datasetCommon, SystemOpenApiTagMap.dataset],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: GetDatasetListV2BodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功返回知识库列表',
+          content: {
+            'application/json': {
+              schema: GetDatasetListV2ResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/core/dataset/paths': {
+    get: {
+      summary: '获取知识库路径',
+      description: '获取知识库的父级路径链,用于面包屑导航',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestParams: {
+        query: GetDatasetPathsQuerySchema
+      },
+      responses: {
+        200: {
+          description: '成功返回路径列表'
+        }
+      }
+    }
+  },
+  '/core/dataset/detail': {
+    get: {
+      summary: '获取知识库详情',
+      description: '获取知识库详细信息,包括模型配置、权限和同步状态',
+      tags: [DevApiTagsMap.datasetCommon, SystemOpenApiTagMap.dataset],
+      requestParams: {
+        query: GetDatasetDetailQuerySchema
+      },
+      responses: {
+        200: {
+          description: '成功返回知识库详情（不包含创建时间）',
+          content: {
+            'application/json': {
+              schema: GetDatasetDetailResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/proApi/core/dataset/changeOwner': {
+    post: {
+      summary: '转让知识库所有权',
+      description: '将知识库所有权转让给指定团队成员',
+      tags: [DevApiTagsMap.permissionResource, DevApiTagsMap.datasetPermission],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: ChangeDatasetOwnerBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功转让知识库所有权',
+          content: {
+            'application/json': {
+              schema: ChangeDatasetOwnerResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/proApi/core/dataset/collaborator/list': {
+    get: {
+      summary: '获取知识库协作者列表',
+      description: '获取知识库协作者列表，包含继承权限场景下的父级协作者信息',
+      tags: [DevApiTagsMap.permissionCollaborator, DevApiTagsMap.datasetPermission],
+      requestParams: {
+        query: GetDatasetCollaboratorListQuerySchema
+      },
+      responses: {
+        200: {
+          description: '成功获取知识库协作者列表',
+          content: {
+            'application/json': {
+              schema: GetDatasetCollaboratorListResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/proApi/core/dataset/collaborator/update': {
+    post: {
+      summary: '更新知识库协作者',
+      description: '覆盖更新知识库或知识库文件夹的协作者权限',
+      tags: [DevApiTagsMap.permissionCollaborator, DevApiTagsMap.datasetPermission],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: UpdateDatasetCollaboratorBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功更新知识库协作者',
+          content: {
+            'application/json': {
+              schema: UpdateDatasetCollaboratorResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/proApi/core/dataset/datasetSync': {
+    post: {
+      summary: '同步知识库数据',
+      description: '检查知识库同步状态、训练状态、权限和索引额度后，触发知识库同步任务',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: PostDatasetSyncBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '同步任务创建成功，无业务数据返回'
+        }
+      }
+    }
+  },
+  '/core/dataset/delete': {
+    delete: {
+      summary: '删除知识库',
+      description: '删除知识库及其所有子知识库,需要所有者权限',
+      tags: [DevApiTagsMap.datasetCommon, SystemOpenApiTagMap.dataset],
+      requestParams: {
+        query: DeleteDatasetQuerySchema
+      },
+      responses: {
+        200: {
+          description: '成功删除知识库'
+        }
+      }
+    }
+  },
+  '/core/dataset/update': {
+    put: {
+      summary: '更新知识库',
+      description: '更新知识库信息、配置或移动知识库到其他目录',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: UpdateDatasetBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功更新知识库'
+        }
+      }
+    }
+  },
+  '/core/dataset/resumeInheritPermission': {
+    put: {
+      summary: '恢复知识库继承权限',
+      description: '恢复知识库的继承权限,使其权限与父级保持一致',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: ResumeDatasetInheritPermissionBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功恢复继承权限'
+        }
+      }
+    }
+  },
+  '/core/dataset/enableCollectionPermission': {
+    post: {
+      summary: '启用知识库的文件级权限',
+      description:
+        '开启该知识库的文件/文件夹级权限：物化全部文件/文件夹的权限快照后置位开关。开启后可为单个文件/文件夹单独配置协作者；未单独配置的仍继承知识库权限。需要知识库管理权限',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: EnableCollectionPermissionBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功启用文件级权限',
+          content: {
+            'application/json': {
+              schema: EnableCollectionPermissionResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/core/dataset/disableCollectionPermission': {
+    post: {
+      summary: '关闭知识库的文件级权限',
+      description:
+        '关闭该知识库的文件/文件夹级权限：删除全部文件/文件夹的协作者配置并重置为继承态，随后关闭开关。该操作不可恢复，需要知识库管理权限',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: DisableCollectionPermissionBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功关闭文件级权限',
+          content: {
+            'application/json': {
+              schema: DisableCollectionPermissionResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/core/dataset/searchTest': {
+    post: {
+      summary: '搜索测试',
+      description: `对单个知识库执行文本、图片或图文检索，返回命中片段、实际检索配置和耗时。支持 API Key 或登录态鉴权，需要知识库读取权限，结果仅包含当前调用者可读的集合。
+
+- 输入格式：选择“文本检索”或“图片检索”；至少提供非空白的 \`text\` 或一张 \`queryImageUrls\` 图片，也可以两者同时传入。
+- 图片上传：先调用 \`/core/dataset/file/presignSearchTestImage\`，按返回的预签名信息上传图片，再将 \`temp/\${teamId}/...\` key 传入 \`queryImageUrls\`。最多 10 张，仅接受当前团队的临时 key，不支持公网 URL、dataset key 或 chat key。
+- 检索配置：支持向量、全文和混合检索，以及文本重排序和问题扩展；纯图片输入不执行文本扩展。
+- \`limit\` 是召回内容的 token 预算，并非结果条数；默认 5000，超过 20000 时按 20000 处理。`,
+      tags: [DevApiTagsMap.datasetCommon, SystemOpenApiTagMap.datasetOther],
+      requestBody: {
+        content: {
+          'application/json': {
+            schema: SearchDatasetTestBodySchema
+          }
+        }
+      },
+      responses: {
+        200: {
+          description: '成功返回搜索结果列表、实际检索配置及耗时信息',
+          content: {
+            'application/json': {
+              schema: SearchDatasetTestResponseSchema
+            }
+          }
+        }
+      }
+    }
+  },
+  '/core/dataset/exportAll': {
+    get: {
+      summary: '导出知识库全部数据',
+      description: '以流式 CSV 格式导出单个知识库的数据；目录不支持导出',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestParams: {
+        query: ExportDatasetQuerySchema
+      },
+      responses: {
+        200: {
+          description: '流式返回 CSV 文件'
+        }
+      }
+    }
+  },
+  '/core/dataset/getPermission': {
+    get: {
+      summary: '获取知识库引用权限',
+      description: '获取当前用户对指定知识库的读写权限，鉴权失败时返回无权限结果而非报错',
+      tags: [DevApiTagsMap.datasetCommon],
+      requestParams: {
+        query: GetDatasetPermissionQuerySchema
+      },
+      responses: {
+        200: {
+          description: '成功返回知识库名称和读写权限，无访问权限时返回空名称和 false'
+        }
+      }
+    }
+  },
+
+  ...DatasetCollectionPath,
+  ...DatasetDataPath,
+  ...ApiDatasetPath,
+  ...DatasetTagPath,
+  ...DatasetFilePath,
+  ...DatasetTrainingPath,
+  ...DatasetSynonymPath,
+  ...DatasetBatchPath
+};

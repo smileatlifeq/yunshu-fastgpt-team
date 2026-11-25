@@ -1,0 +1,104 @@
+import { LangEnum, LocaleList, type I18nStringType, type localeType } from './type';
+
+/** 插件 SDK 的本地化文案允许只提供部分语言，缺少当前语言时由解析器逐级回退。 */
+type I18nStringLikeType = {
+  en?: string;
+  'zh-CN'?: string;
+  'zh-Hant'?: string;
+  'ko-KR'?: string;
+};
+
+/**
+ * i18n key 标记函数。
+ * 只返回原 key，用于在 global/service 层声明可翻译字段并保留字面量类型；真正翻译仍由前端 i18next 处理。
+ */
+export const i18nT = <T extends string>(key: T): T => key;
+
+/**
+ * 将浏览器、Cookie 或请求头中的语言标签归一化为 FastGPT 支持的 locale。
+ * 语言标签不区分大小写，并兼容下划线、纯语言码及同语言的地区变体。
+ */
+export const parseLocale = (value?: string): localeType | undefined => {
+  if (!value) return;
+
+  const normalized = value.trim().toLowerCase().replaceAll('_', '-');
+  if (normalized === 'en' || normalized.startsWith('en-')) {
+    return LangEnum.en;
+  }
+  if (normalized === 'ko' || normalized.startsWith('ko-')) {
+    return LangEnum.ko_KR;
+  }
+  if (
+    normalized === LangEnum.zh_Hant.toLowerCase() ||
+    normalized.startsWith('zh-hant-') ||
+    ['zh-tw', 'zh-hk'].includes(normalized)
+  ) {
+    return LangEnum.zh_Hant;
+  }
+  if (
+    normalized === LangEnum.zh_CN.toLowerCase() ||
+    normalized === 'zh' ||
+    normalized.startsWith('zh-')
+  ) {
+    return LangEnum.zh_CN;
+  }
+
+  return LocaleList.find((locale) => locale.toLowerCase() === normalized);
+};
+
+export const parseI18nString = (str: I18nStringLikeType | string = '', lang = 'en') => {
+  if (!str || typeof str === 'string') return str;
+
+  // 尝试使用当前语言
+  if (lang in str) {
+    return str[lang as keyof I18nStringLikeType] || '';
+  }
+
+  // 如果当前语言是繁体中文但没有对应翻译，优先回退到简体中文
+  if (lang === 'zh-Hant' && !str['zh-Hant'] && str['zh-CN']) {
+    return str['zh-CN'];
+  }
+
+  // 最后回退到英文
+  return str['en'] || '';
+};
+
+/**
+ * 选择插件元数据文案：优先当前支持的语言，再回退简体中文和英文；空字符串视为有效翻译。
+ */
+export const selectPluginText = (
+  value: string | Partial<I18nStringType> | undefined,
+  locale?: string
+): string => {
+  if (typeof value === 'string') return value;
+  if (!value) return '';
+
+  const selectedLocale = parseLocale(locale) ?? LangEnum.en;
+  return value[selectedLocale] ?? value[LangEnum.zh_CN] ?? value[LangEnum.en] ?? '';
+};
+
+/**
+ * 按当前语言选择插件 README 地址，并兼容旧版单地址字段。
+ */
+export const selectReadmeUrl = (
+  plugin: {
+    readmeUrls?: Partial<Record<localeType, string>>;
+    readmeUrl?: string;
+  },
+  locale?: string
+): string | undefined => {
+  const selectedLocale = parseLocale(locale) ?? LangEnum.en;
+  return (
+    plugin.readmeUrls?.[selectedLocale] ??
+    plugin.readmeUrls?.[LangEnum.zh_CN] ??
+    plugin.readmeUrls?.[LangEnum.en] ??
+    plugin.readmeUrl
+  );
+};
+
+export const formatI18nLocationToZhEn = (locale: localeType = 'zh-CN'): 'zh' | 'en' => {
+  if (locale.toLocaleLowerCase().startsWith('zh')) {
+    return 'zh';
+  }
+  return 'en';
+};

@@ -1,0 +1,993 @@
+import { type MutableRefObject, useEffect, useMemo, useRef } from 'react';
+import { useContextSelector } from 'use-context-selector';
+import { useTranslation } from 'next-i18next';
+import { useMemoizedFn } from 'ahooks';
+import { useToast } from '@fastgpt/web/hooks/useToast';
+import { useSystem } from '@fastgpt/web/hooks/useSystem';
+import { getErrText } from '@fastgpt/global/common/error/utils';
+import { getNanoid } from '@fastgpt/global/common/string/tools';
+import type {
+  AIChatItemValueItemType,
+  SandboxStatusPhase,
+  UserChatItemValueItemType
+} from '@fastgpt/global/core/chat/type';
+import {
+  ChatGenerateStatusEnum,
+  ChatRoleEnum,
+  ChatStatusEnum
+} from '@fastgpt/global/core/chat/constants';
+import { chats2GPTMessages } from '@fastgpt/global/core/chat/adapt';
+import {
+  appendNodeResponseByParent,
+  mergeNodeResponseDataByIdAndParent
+} from '@fastgpt/global/core/chat/utils/mergeNode';
+import { SseResponseEventEnum } from '@fastgpt/global/core/workflow/runtime/constants';
+import { AuxiliaryGenerationEventEnum } from '@fastgpt/global/core/ai/auxiliaryGeneration/constants';
+import { TeamErrEnum } from '@fastgpt/global/common/error/code/team';
+import { useSystemStore } from '@/web/common/system/useSystemStore';
+import { ChatItemContext } from '@/web/core/chat/context/chatItemContext';
+import { ChatRecordContext } from '@/web/core/chat/context/chatRecordContext';
+import { WorkflowRuntimeContext } from '../../context/workflowRuntimeContext';
+import { ChatBoxContext } from '../Provider';
+import { formatChatValue2InputType, stripChatValueFileUrls } from '../utils/chatValue';
+import {
+  getInteractiveByHistories,
+  refreshSubmittedFormInteractiveValues,
+  resolveInteractiveResponseChatItemId,
+  rewriteHistoriesByInteractiveResponse
+} from '../utils/interactive';
+import { shouldAppendResumeInteractive } from '../utils/resume';
+import { formatChatRequestVariables } from '../utils/requestVariables';
+import {
+  createStreamRenderScheduler,
+  shouldScheduleStreamRender
+} from '../utils/streamRenderScheduler';
+import type { ChatSiteItemType, ChatBoxInputType, SendPromptFnType } from '../type';
+import type { StartChatFnProps, generatingMessageProps } from '../../type';
+import { cloneDeep } from 'lodash-es';
+import type { ResolvedChatAuthTargetInput } from '@/web/core/chat/type';
+import { useChatAuthApiTarget } from '@/web/core/chat/utils';
+import { getChatItemErrorText } from '@/global/core/chat/utils';
+import {
+  isChatGeneratingError,
+  safeAbortController,
+  shouldRestoreSubmittedChatInput
+} from '../utils/generate';
+import { getLastAiDataId } from '../utils/resume';
+import type { ChatGeneratingConflictRecovery } from '../type';
+
+import type { ChatInputSubmission } from '@/web/core/chat/inputDraft/useChatInputDraft';
+
+type HumanChatSiteItemType = Extract<ChatSiteItemType, { obj: ChatRoleEnum.Human }>;
+
+type NotifyChatGenerateStatusChange = (
+  status: ChatGenerateStatusEnum,
+  options?: {
+    hasBeenRead?: boolean;
+    targetSourceKey?: string;
+    targetChatId?: string;
+    title?: string;
+  }
+) => void;
+
+type FinishChatGenerateStatus = (params: {
+  status: ChatGenerateStatusEnum;
+  finishedInActiveChat: boolean;
+  targetChatTarget?: ResolvedChatAuthTargetInput;
+  targetSourceKey?: string;
+  targetChatId?: string;
+  shouldUpdateChatBoxData?: (state: {
+    sourceKey?: string;
+    appId?: string;
+    chatId?: string;
+  }) => boolean;
+}) => void;
+
+const STREAM_RENDER_MIN_INTERVAL_MS = 50;
+const STREAM_RENDER_MAX_INTERVAL_MS = 96;
+const STREAM_RENDER_TARGET_TAIL_LENGTH = 256;
+
+type QueuedGeneratingMessage = generatingMessageProps & {
+  autoTTSResponse?: boolean;
+};
+
+type UseChatGenerateProps = {
+  onStartChat?: (e: StartChatFnProps) => Promise<{ responseText: string; isNewChat?: boolean }>;
+  onGeneratingMessage?: (message: generatingMessageProps) => void;
+  isRoundPending: boolean;
+  chatControllerRef: MutableRefObject<AbortController>;
+  questionGuideControllerRef: MutableRefObject<AbortController>;
+  pluginControllerRef: MutableRefObject<AbortController>;
+  resumeControllerRef: MutableRefObject<AbortController | undefined>;
+  resumedChatTargetRef: MutableRefObject<string | undefined>;
+  activeSourceKeyRef: MutableRefObject<string | undefined>;
+  activeChatIdRef: MutableRefObject<string | undefined>;
+  TextareaDom: MutableRefObject<HTMLTextAreaElement | null>;
+  captureSubmittedInput: (input: ChatBoxInputType) => ChatInputSubmission;
+  isSubmittedInputCurrent: (submission: ChatInputSubmission) => boolean;
+  clearSubmittedInput: (submission: ChatInputSubmission) => void;
+  restoreSubmittedInput: (submission: ChatInputSubmission) => void;
+  setQuestionGuide: (guides: string[]) => void;
+  createQuestionGuide: () => Promise<void>;
+  scrollToBottom: (behavior?: 'smooth' | 'auto', delay?: number) => void;
+  generatingScroll: (force?: boolean) => void;
+  notifyChatGenerateStatusChange: NotifyChatGenerateStatusChange;
+  finishChatGenerateStatus: FinishChatGenerateStatus;
+  onChatGeneratingConflict?: (recovery: ChatGeneratingConflictRecovery) => void;
+};
+
+const isAbortByLeave = (reason: unknown) => {
+  return reason === 'leave' || (reason instanceof Error && reason.message === 'leave');
+};
+
+/**
+ * 管理 ChatBox 的普通发送和 SSE 增量生成流程。
+ *
+ * 这个 hook 承接原 `ChatBox/index.tsx` 中最核心的运行时逻辑：
+ * - `generatingMessage`：按 SSE event 增量更新最后一条 AI 消息。
+ * - `sendPrompt`：校验输入、创建 human/AI placeholder、调用 `onStartChat`、处理完成和失败。
+ * - `abortRequest`：统一中断 chat、question guide、plugin 和 resume 请求，用于服务端确认停止后的本地中断及页面生命周期清理。
+ *
+ * 输入约定：
+ * - refs 仍由 ChatBox 持有，保证页面切换、恢复生成等生命周期清理共用同一组 controller。
+ * - 输入快照、草稿清理、失败恢复、问题引导和滚动由基础 hook 提供，本 hook 只编排生成流程。
+ * - `notifyChatGenerateStatusChange` 只负责把生成状态变化抛给外部，不感知侧栏历史等外部模型。
+ *
+ * 边界行为：
+ * - `generatingMessage` 仍只更新最后一条 AI 消息；如果最后一条不是 AI，则直接跳过。
+ * - 普通生成和恢复流都先通知业务事件回调，避免恢复时遗漏表单配置等聊天内容以外的事件。
+ * - Ask/Preview 回复会新建 user/AI 轮次并回写旧交互状态；表单等 submit 交互继续使用原 AI。
+ * - 发送失败且后端没有返回 `responseText` 时恢复用户输入，并回滚本轮 human/AI placeholder。
+ * - `abortRequest('leave')` 后无论流正常返回或抛错，都保留服务端生成状态，不更新当前会话。
+ */
+export const useChatGenerate = ({
+  onStartChat,
+  onGeneratingMessage,
+  isRoundPending,
+  chatControllerRef,
+  questionGuideControllerRef,
+  pluginControllerRef,
+  resumeControllerRef,
+  resumedChatTargetRef,
+  activeSourceKeyRef,
+  activeChatIdRef,
+  TextareaDom,
+  captureSubmittedInput,
+  isSubmittedInputCurrent,
+  clearSubmittedInput,
+  restoreSubmittedInput,
+  setQuestionGuide,
+  createQuestionGuide,
+  scrollToBottom,
+  generatingScroll,
+  notifyChatGenerateStatusChange,
+  finishChatGenerateStatus,
+  onChatGeneratingConflict
+}: UseChatGenerateProps) => {
+  const { t } = useTranslation();
+  const { toast } = useToast();
+  const { isPc } = useSystem();
+  const { setNotSufficientModalType } = useSystemStore();
+
+  const setChatBoxData = useContextSelector(ChatItemContext, (v) => v.setChatBoxData);
+  const variablesForm = useContextSelector(ChatItemContext, (v) => v.variablesForm);
+  const resetVariables = useContextSelector(ChatItemContext, (v) => v.resetVariables);
+  const chatRecords = useContextSelector(ChatRecordContext, (v) => v.chatRecords);
+  const setChatRecords = useContextSelector(ChatRecordContext, (v) => v.setChatRecords);
+  const sourceKey = useContextSelector(WorkflowRuntimeContext, (v) => v.sourceKey);
+  const chatId = useContextSelector(WorkflowRuntimeContext, (v) => v.chatId);
+  const variableList = useContextSelector(ChatBoxContext, (v) => v.variableList);
+  const startSegmentedAudio = useContextSelector(ChatBoxContext, (v) => v.startSegmentedAudio);
+  const finishSegmentedAudio = useContextSelector(ChatBoxContext, (v) => v.finishSegmentedAudio);
+  const setAudioPlayingChatId = useContextSelector(ChatBoxContext, (v) => v.setAudioPlayingChatId);
+  const splitText2Audio = useContextSelector(ChatBoxContext, (v) => v.splitText2Audio);
+  const sourceTarget = useContextSelector(WorkflowRuntimeContext, (v) => v.sourceTarget);
+  const outLinkAuthData = useContextSelector(WorkflowRuntimeContext, (v) => v.outLinkAuthData);
+  const chatAuthTarget = useChatAuthApiTarget({ sourceTarget, outLinkAuthData });
+
+  const generatingMessageQueueRef = useRef<QueuedGeneratingMessage[]>([]);
+  // React 状态提交前也要同步锁住发送，避免同一渲染周期创建两条本地生成流。
+  const chatRequestActiveRef = useRef(false);
+
+  const applyGeneratingMessage = useMemoizedFn(
+    (
+      state: ChatSiteItemType[],
+      {
+        responseValueId,
+        event,
+        text = '',
+        reasoningText,
+        status,
+        name,
+        tool,
+        interactive,
+        plan,
+        planStatus,
+        sandboxStatus,
+        skill,
+        workflowBuilderVersion,
+        chatAgentBuilderVersion,
+        variables,
+        nodeResponse,
+        durationSeconds,
+        autoTTSResponse
+      }: QueuedGeneratingMessage
+    ) => {
+      const histories = nodeResponse?.formInputResult
+        ? refreshSubmittedFormInteractiveValues({
+            histories: state,
+            nodeResponse
+          })
+        : state;
+
+      return histories.map((item, index) => {
+        if (index !== histories.length - 1) return item;
+        if (item.obj !== ChatRoleEnum.AI) return item;
+
+        if (autoTTSResponse) {
+          splitText2Audio(formatChatValue2InputType(item.value).text || '');
+        }
+
+        if (event === SseResponseEventEnum.flowNodeResponse && nodeResponse) {
+          return {
+            ...item,
+            responseData: appendNodeResponseByParent(item.responseData, nodeResponse)
+          };
+        }
+        if (event === AuxiliaryGenerationEventEnum.status && status) {
+          if (status === 'finish') {
+            return {
+              ...item,
+              status: ChatStatusEnum.loading,
+              moduleName: name || item.moduleName
+            };
+          }
+
+          return {
+            ...item,
+            status,
+            moduleName: name || item.moduleName
+          };
+        }
+        if (event === SseResponseEventEnum.flowNodeStatus && status) {
+          return {
+            ...item,
+            status,
+            moduleName: name
+          };
+        }
+        if (event === SseResponseEventEnum.sandboxStatus && sandboxStatus) {
+          const getSandboxPhaseLabel = (): string => {
+            const { phase, isWarmStart, skillName, message } = sandboxStatus;
+            const phaseLabelMap: Record<Exclude<SandboxStatusPhase, 'ready' | 'failed'>, string> = {
+              checkExisting: t('chat:sandbox_status_checkExisting'),
+              connecting: t('chat:sandbox_status_connecting'),
+              fetchSkills: t('chat:sandbox_status_fetchSkills'),
+              creatingContainer: t('chat:sandbox_status_creatingContainer'),
+              deployingSkills: t('chat:sandbox_status_deployingSkills', {
+                skillName: skillName ?? ''
+              }),
+              downloadingPackage: t('chat:sandbox_status_downloadingPackage'),
+              uploadingPackage: t('chat:sandbox_status_uploadingPackage'),
+              extractingPackage: t('chat:sandbox_status_extractingPackage'),
+              lazyInit: t('chat:sandbox_status_lazyInit'),
+              upgrading: t('chat:sandbox_status_upgrading')
+            };
+
+            if (phase === 'ready') {
+              return isWarmStart
+                ? t('chat:sandbox_status_ready_warm')
+                : t('chat:sandbox_status_ready_cold');
+            }
+            if (phase === 'failed') {
+              return message
+                ? t('chat:sandbox_status_failed_with_message', { message })
+                : t('chat:sandbox_status_failed');
+            }
+
+            return phaseLabelMap[phase];
+          };
+          return {
+            ...item,
+            status: 'loading' as const,
+            moduleName: getSandboxPhaseLabel()
+          };
+        }
+        if (event === SseResponseEventEnum.skillCall && skill) {
+          const alreadyExists = item.value.some(
+            (v) =>
+              v.id === responseValueId && v.skills?.some((s) => s.skillMdPath === skill.skillMdPath)
+          );
+          if (alreadyExists) return item;
+
+          const skillId = skill.id || responseValueId || getNanoid(10);
+          const val: AIChatItemValueItemType = {
+            id: responseValueId,
+            skills: [
+              {
+                id: skillId,
+                skillName: skill.skillName,
+                skillAvatar: skill.skillAvatar || '',
+                description: skill.description,
+                skillMdPath: skill.skillMdPath
+              }
+            ]
+          };
+          return {
+            ...item,
+            value: [...item.value, val]
+          };
+        }
+        if (event === SseResponseEventEnum.answer || event === SseResponseEventEnum.fastAnswer) {
+          const answerUpdateIndex = (() => {
+            if (responseValueId) {
+              return item.value.findIndex((item) => item.id === responseValueId);
+            }
+
+            const latestIndex = item.value.length - 1;
+            const latestValue = item.value[latestIndex];
+
+            // reason 流只能续写“纯 reasoning”占位；否则说明上一段回答已成型，需要新起一段。
+            if (
+              reasoningText &&
+              latestValue?.reasoning &&
+              !latestValue.text?.content &&
+              !latestValue.tools?.length &&
+              !latestValue.tool &&
+              !latestValue.skills?.length &&
+              !latestValue.interactive &&
+              !latestValue.plan &&
+              !latestValue.planStatus &&
+              !latestValue.agentPlanUpdate &&
+              !latestValue.agentAsk &&
+              !latestValue.contextCheckpoint
+            ) {
+              return latestIndex;
+            }
+
+            if (text) return latestIndex;
+
+            return -1;
+          })();
+          const answerUpdateValue: AIChatItemValueItemType | undefined =
+            answerUpdateIndex >= 0 ? cloneDeep(item.value[answerUpdateIndex]) : undefined;
+          const replaceUpdateValue = (nextValue: AIChatItemValueItemType) => ({
+            ...item,
+            value: [
+              ...item.value.slice(0, answerUpdateIndex),
+              nextValue,
+              ...item.value.slice(answerUpdateIndex + 1)
+            ]
+          });
+
+          if (reasoningText) {
+            if (answerUpdateValue?.reasoning) {
+              answerUpdateValue.reasoning.content += reasoningText;
+              return replaceUpdateValue(answerUpdateValue);
+            } else if (answerUpdateValue?.text && !answerUpdateValue.text.content) {
+              answerUpdateValue.reasoning = {
+                content: reasoningText
+              };
+              return replaceUpdateValue(answerUpdateValue);
+            } else {
+              const val: AIChatItemValueItemType = {
+                id: responseValueId,
+                reasoning: {
+                  content: reasoningText
+                }
+              };
+              return {
+                ...item,
+                value: [...item.value, val]
+              };
+            }
+          }
+          if (text) {
+            if (answerUpdateValue?.text) {
+              answerUpdateValue.text.content += text;
+              return replaceUpdateValue(answerUpdateValue);
+            } else if (answerUpdateValue?.reasoning) {
+              answerUpdateValue.text = {
+                content: text
+              };
+              return replaceUpdateValue(answerUpdateValue);
+            } else {
+              const newValue: AIChatItemValueItemType = {
+                id: responseValueId,
+                text: {
+                  content: text
+                }
+              };
+              return {
+                ...item,
+                value: item.value.concat(newValue)
+              };
+            }
+          }
+        }
+
+        if (event === SseResponseEventEnum.toolCall && tool) {
+          const val: AIChatItemValueItemType = {
+            id: responseValueId || tool.id,
+            tools: [tool]
+          };
+          return {
+            ...item,
+            value: [...item.value, val]
+          };
+        }
+        if (
+          (event === SseResponseEventEnum.toolParams ||
+            event === SseResponseEventEnum.toolResponse) &&
+          tool
+        ) {
+          const field = event === SseResponseEventEnum.toolParams ? 'params' : 'response';
+          const delta = tool[field];
+          if (typeof delta !== 'string' || (field === 'params' && !delta)) return item;
+
+          // 仅按工具 ID 合并；孤立增量不能落到最后一个正文或尚为空的新 AI 占位上。
+          return {
+            ...item,
+            value: item.value.map((value) => {
+              if (!value.tools?.some((currentTool) => currentTool.id === tool.id)) return value;
+
+              return {
+                ...value,
+                tools: value.tools.map((currentTool) =>
+                  currentTool.id === tool.id
+                    ? { ...currentTool, [field]: `${currentTool[field] || ''}${delta}` }
+                    : currentTool
+                )
+              };
+            })
+          };
+        }
+
+        if (event === SseResponseEventEnum.planStatus && planStatus) {
+          const planStatusIndex = item.value.findIndex(
+            (value) => !!value.planStatus || (!!responseValueId && value.id === responseValueId)
+          );
+          const nextPlanStatusValue: AIChatItemValueItemType = {
+            id: responseValueId,
+            planStatus
+          };
+
+          if (planStatusIndex >= 0) {
+            return {
+              ...item,
+              value: [
+                ...item.value.slice(0, planStatusIndex),
+                {
+                  ...item.value[planStatusIndex],
+                  ...nextPlanStatusValue
+                },
+                ...item.value.slice(planStatusIndex + 1)
+              ]
+            };
+          }
+
+          return {
+            ...item,
+            value: [...item.value, nextPlanStatusValue]
+          };
+        }
+        if (event === SseResponseEventEnum.plan && plan) {
+          const planIndex = item.value.findIndex(
+            (value) =>
+              (!!responseValueId && value.id === responseValueId) ||
+              !!value.planStatus ||
+              (value.plan?.planId && value.plan.planId === plan.planId)
+          );
+          const nextPlanValue = {
+            id: responseValueId || plan.planId,
+            plan,
+            planStatus: undefined
+          };
+
+          if (planIndex >= 0) {
+            return {
+              ...item,
+              value: [
+                ...item.value.slice(0, planIndex),
+                {
+                  ...item.value[planIndex],
+                  ...nextPlanValue
+                },
+                ...item.value.slice(planIndex + 1)
+              ]
+            };
+          }
+
+          return {
+            ...item,
+            value: [...item.value, nextPlanValue]
+          };
+        }
+        if (event === SseResponseEventEnum.updateVariables && variables) {
+          resetVariables({ variables });
+        }
+        if (event === SseResponseEventEnum.interactive && interactive) {
+          if (
+            !shouldAppendResumeInteractive({
+              existingValues: item.value,
+              incomingInteractive: interactive
+            })
+          ) {
+            return item;
+          }
+
+          const val: AIChatItemValueItemType = {
+            interactive
+          };
+
+          return {
+            ...item,
+            value: item.value.concat(val)
+          };
+        }
+        if (event === AuxiliaryGenerationEventEnum.chatAgentConfig && chatAgentBuilderVersion) {
+          // 一轮内多次生成时展示最后一次成功配置，与最终落库的引用保持一致。
+          return {
+            ...item,
+            value: item.value
+              .filter((value) => !value.chatAgentBuilderVersion)
+              .concat({ chatAgentBuilderVersion })
+          };
+        }
+        if (event === SseResponseEventEnum.workflowBuilderVersion && workflowBuilderVersion) {
+          return {
+            ...item,
+            value: item.value.concat({ workflowBuilderVersion })
+          };
+        }
+
+        if (event === SseResponseEventEnum.workflowDuration && durationSeconds) {
+          return {
+            ...item,
+            durationSeconds: item.durationSeconds
+              ? +(item.durationSeconds + durationSeconds).toFixed(2)
+              : durationSeconds
+          };
+        }
+
+        return item;
+      });
+    }
+  );
+
+  const commitGeneratingMessageQueue = useMemoizedFn(() => {
+    const queue = generatingMessageQueueRef.current;
+    if (queue.length === 0) return false;
+
+    generatingMessageQueueRef.current = [];
+    setChatRecords((state) =>
+      queue.reduce((histories, message) => applyGeneratingMessage(histories, message), state)
+    );
+
+    generatingScroll(queue.some((message) => message.event === SseResponseEventEnum.interactive));
+    return true;
+  });
+  const getStreamRenderInterval = useMemoizedFn(() => {
+    const queuedTextLength = generatingMessageQueueRef.current.reduce(
+      (length, message) =>
+        length + (message.text?.length || 0) + (message.reasoningText?.length || 0),
+      0
+    );
+    const lastChatRecord = chatRecords[chatRecords.length - 1];
+    const currentText =
+      lastChatRecord?.obj === ChatRoleEnum.AI
+        ? formatChatValue2InputType(lastChatRecord.value).text || ''
+        : '';
+    const lastBlockStart = currentText.lastIndexOf('\n\n');
+    const activeTailLength = currentText.length - (lastBlockStart >= 0 ? lastBlockStart + 2 : 0);
+    const renderLoad = Math.min(
+      Math.max(activeTailLength, queuedTextLength),
+      STREAM_RENDER_TARGET_TAIL_LENGTH
+    );
+
+    // 长 block 的 parse/layout 成本更高，逐步降低提交频率；短文本仍保持约 20Hz。
+    return Math.round(
+      STREAM_RENDER_MIN_INTERVAL_MS +
+        (renderLoad / STREAM_RENDER_TARGET_TAIL_LENGTH) *
+          (STREAM_RENDER_MAX_INTERVAL_MS - STREAM_RENDER_MIN_INTERVAL_MS)
+    );
+  });
+  const streamRenderScheduler = useMemo(
+    () =>
+      createStreamRenderScheduler({
+        onFlush: commitGeneratingMessageQueue,
+        intervalMs: getStreamRenderInterval
+      }),
+    [commitGeneratingMessageQueue, getStreamRenderInterval]
+  );
+  const flushGeneratingMessageQueue = useMemoizedFn(() => {
+    streamRenderScheduler.flush();
+  });
+  const cancelGeneratingMessageQueue = useMemoizedFn(() => {
+    streamRenderScheduler.cancel();
+    generatingMessageQueueRef.current = [];
+  });
+
+  const generatingMessage = useMemoizedFn(
+    (message: generatingMessageProps & { autoTTSResponse?: boolean }) => {
+      onGeneratingMessage?.(message);
+
+      if (message.event === SseResponseEventEnum.chatTitle && message.title) {
+        setChatBoxData((state) =>
+          state.sourceKey === sourceKey && state.chatId === chatId
+            ? {
+                ...state,
+                title: message.title
+              }
+            : state
+        );
+        notifyChatGenerateStatusChange(ChatGenerateStatusEnum.generating, {
+          title: message.title,
+          targetSourceKey: sourceKey,
+          targetChatId: chatId
+        });
+        return;
+      }
+
+      if (!shouldScheduleStreamRender(message.event)) {
+        // 先提交之前的文本，保证工具和状态事件与 SSE 到达顺序一致。
+        streamRenderScheduler.flush();
+        setChatRecords((state) => applyGeneratingMessage(state, message));
+        generatingScroll(message.event === SseResponseEventEnum.interactive);
+        return;
+      }
+
+      generatingMessageQueueRef.current.push(message);
+      streamRenderScheduler.schedule();
+    }
+  );
+
+  useEffect(() => {
+    return () => {
+      cancelGeneratingMessageQueue();
+    };
+  }, [cancelGeneratingMessageQueue]);
+
+  const abortRequest = useMemoizedFn((reason: string = 'stop') => {
+    if (reason === 'leave') {
+      cancelGeneratingMessageQueue();
+    }
+    const abortReason = new Error(reason);
+    safeAbortController(chatControllerRef.current, abortReason);
+    safeAbortController(questionGuideControllerRef.current, abortReason);
+    safeAbortController(pluginControllerRef.current, abortReason);
+    safeAbortController(resumeControllerRef.current, abortReason);
+  });
+
+  const sendPrompt = useMemoizedFn<SendPromptFnType>(
+    ({
+      text = '',
+      files = [],
+      history = chatRecords,
+      interactive,
+      select,
+      autoTTSResponse = false,
+      hideInUI = false,
+      clearInput = false
+    }) => {
+      // 变量校验可能异步完成，发送快照必须在点击时固定，避免期间编辑的内容被清掉。
+      const submission = clearInput ? captureSubmittedInput({ text, files }) : undefined;
+      variablesForm.handleSubmit(
+        async ({ variables = {} }) => {
+          if (!onStartChat) return;
+          if (
+            activeSourceKeyRef.current !== sourceKey ||
+            activeChatIdRef.current !== chatId ||
+            (submission && !isSubmittedInputCurrent(submission))
+          )
+            return;
+          if (isRoundPending || chatRequestActiveRef.current) {
+            if (!hideInUI) {
+              toast({
+                title: t('chat:is_chatting'),
+                status: 'warning'
+              });
+            }
+            return;
+          }
+
+          safeAbortController(questionGuideControllerRef.current, new Error('stop'));
+
+          text = text.trim();
+
+          if (!text && files.length === 0 && !select) {
+            toast({
+              title: t('chat:content_empty'),
+              status: 'warning'
+            });
+            return;
+          }
+
+          const requestVariables = formatChatRequestVariables({ variableList, variables });
+
+          const humanChatId = getNanoid(24);
+          const currentChatTarget = chatAuthTarget;
+          const responseChatId = resolveInteractiveResponseChatItemId({
+            histories: history,
+            interactive,
+            interactiveVal: text,
+            responseChatItemId: getNanoid(24)
+          });
+          const previousAiDataId = getLastAiDataId(history);
+          chatRequestActiveRef.current = true;
+          try {
+            if (autoTTSResponse) {
+              await startSegmentedAudio();
+              setAudioPlayingChatId(responseChatId);
+            }
+          } catch (error) {
+            chatRequestActiveRef.current = false;
+            throw error;
+          }
+
+          // 音频初始化等待期间可能已离开当前会话，此时不创建消息或清理新会话输入。
+          if (
+            activeSourceKeyRef.current !== sourceKey ||
+            activeChatIdRef.current !== chatId ||
+            (submission && !isSubmittedInputCurrent(submission))
+          ) {
+            chatRequestActiveRef.current = false;
+            if (autoTTSResponse) finishSegmentedAudio();
+            return;
+          }
+
+          const currentHumanChat: HumanChatSiteItemType = {
+            id: humanChatId,
+            dataId: humanChatId,
+            obj: ChatRoleEnum.Human,
+            time: new Date(),
+            hideInUI,
+            value: [
+              ...files.map((file) => ({
+                file: {
+                  type: file.type,
+                  name: file.name,
+                  url: file.url,
+                  key: file.key || ''
+                }
+              })),
+              ...(select
+                ? [{ select }]
+                : text
+                  ? [
+                      {
+                        text: {
+                          content: text
+                        }
+                      }
+                    ]
+                  : [])
+            ] as UserChatItemValueItemType[],
+            status: ChatStatusEnum.finish
+          };
+
+          const newChatList: ChatSiteItemType[] = [
+            ...history,
+            currentHumanChat,
+            {
+              id: responseChatId,
+              dataId: responseChatId,
+              obj: ChatRoleEnum.AI,
+              value: [
+                {
+                  text: {
+                    content: ''
+                  }
+                }
+              ],
+              status: ChatStatusEnum.loading
+            }
+          ];
+
+          resumedChatTargetRef.current = `${sourceKey}:${chatId}`;
+
+          setChatBoxData((state) =>
+            state.sourceKey === sourceKey && state.chatId === chatId
+              ? {
+                  ...state,
+                  chatGenerateStatus: ChatGenerateStatusEnum.generating,
+                  hasBeenRead: false
+                }
+              : state
+          );
+          notifyChatGenerateStatusChange(ChatGenerateStatusEnum.generating, {
+            hasBeenRead: false,
+            targetSourceKey: sourceKey,
+            targetChatId: chatId
+          });
+
+          setChatRecords(
+            interactive
+              ? rewriteHistoriesByInteractiveResponse({
+                  histories: newChatList,
+                  interactive,
+                  interactiveVal: text
+                })
+              : newChatList
+          );
+
+          if (submission) clearSubmittedInput(submission);
+          setQuestionGuide([]);
+          scrollToBottom('smooth', 100);
+
+          const abortSignal = new AbortController();
+          const isLeaveAborted = () =>
+            abortSignal.signal.aborted && isAbortByLeave(abortSignal.signal.reason);
+
+          try {
+            chatControllerRef.current = abortSignal;
+
+            const messages = chats2GPTMessages({
+              messages: newChatList.slice(0, -1).map((item) => {
+                if (item.obj === ChatRoleEnum.Human) {
+                  return {
+                    ...item,
+                    value: stripChatValueFileUrls(item.value)
+                  };
+                }
+                return item;
+              }),
+              reserveId: true,
+              reserveTool: true,
+              reserveSelect: true
+            });
+            const { responseText } = await onStartChat({
+              messages,
+              responseChatItemId: responseChatId,
+              interactive,
+              controller: abortSignal,
+              generatingMessage: (e) => generatingMessage({ ...e, autoTTSResponse }),
+              variables: requestVariables
+            });
+
+            // 离开只断开本地订阅，流可能正常返回；生成结果仍由服务端状态同步接管。
+            if (isLeaveAborted()) return;
+
+            flushGeneratingMessageQueue();
+
+            let newChatHistories: ChatSiteItemType[] = [];
+            setChatRecords((state) => {
+              newChatHistories = state.map((item, index) => {
+                if (index !== state.length - 1) return item;
+
+                const responseData = mergeNodeResponseDataByIdAndParent(item.responseData || []);
+                if (!abortSignal?.signal?.aborted) {
+                  const errorText = getChatItemErrorText(responseData)?.errorText;
+                  const errorMsg = errorText ? t(errorText) : undefined;
+
+                  return {
+                    ...item,
+                    status: ChatStatusEnum.finish,
+                    time: new Date(),
+                    responseData,
+                    errorMsg
+                  };
+                }
+
+                return {
+                  ...item,
+                  status: ChatStatusEnum.finish,
+                  time: new Date(),
+                  responseData
+                };
+              });
+
+              const { interactive: lastInteractive } = getInteractiveByHistories(state);
+              if (lastInteractive?.type === 'paymentPause' && !lastInteractive.params.continue) {
+                setNotSufficientModalType(TeamErrEnum.aiPointsNotEnough);
+              }
+
+              return newChatHistories;
+            });
+
+            setTimeout(() => {
+              if (!getInteractiveByHistories(newChatHistories).interactive) {
+                createQuestionGuide();
+              }
+
+              generatingScroll();
+              if (isPc) {
+                TextareaDom.current?.focus();
+              }
+            }, 100);
+
+            if (autoTTSResponse) {
+              splitText2Audio(responseText, true);
+            }
+            const finishedInActiveChat =
+              activeSourceKeyRef.current === sourceKey && activeChatIdRef.current === chatId;
+            finishChatGenerateStatus({
+              status: ChatGenerateStatusEnum.done,
+              finishedInActiveChat,
+              targetChatTarget: currentChatTarget,
+              targetSourceKey: sourceKey,
+              targetChatId: chatId,
+              shouldUpdateChatBoxData: (state) =>
+                state.sourceKey === sourceKey && state.chatId === chatId
+            });
+          } catch (err: any) {
+            // 流可能将中断包装为 AbortError，需同时检查 controller 上保留的离开原因。
+            if (isLeaveAborted() || isAbortByLeave(err)) return;
+
+            flushGeneratingMessageQueue();
+
+            if (isChatGeneratingError(err) && onChatGeneratingConflict) {
+              // 服务端已有生成任务，本轮并未真正创建；回滚占位消息后再恢复原有流。
+              setChatRecords(history);
+              if (shouldRestoreSubmittedChatInput({ clearInput })) {
+                if (submission) restoreSubmittedInput(submission);
+              }
+              // 暂时解除本轮发送态；恢复 hook 会用服务端记录校准当前轮并接管后续状态。
+              setChatBoxData((state) =>
+                state.sourceKey === sourceKey && state.chatId === chatId
+                  ? {
+                      ...state,
+                      chatGenerateStatus: ChatGenerateStatusEnum.error
+                    }
+                  : state
+              );
+              onChatGeneratingConflict({
+                previousAiDataId,
+                canReusePreviousAi: responseChatId === previousAiDataId
+              });
+              return;
+            }
+
+            const errorMsg = t(getErrText(err, t('common:core.chat.error.Chat error') as any));
+
+            setChatRecords((state) =>
+              state.map((item, index) => {
+                if (index !== state.length - 1) return item;
+                return {
+                  ...item,
+                  time: new Date(),
+                  status: ChatStatusEnum.finish,
+                  errorMsg
+                };
+              })
+            );
+
+            if (
+              shouldRestoreSubmittedChatInput({
+                clearInput,
+                responseText: err?.responseText
+              })
+            ) {
+              if (submission) restoreSubmittedInput(submission);
+            }
+
+            const finishedInActiveChat =
+              activeSourceKeyRef.current === sourceKey && activeChatIdRef.current === chatId;
+            finishChatGenerateStatus({
+              status: ChatGenerateStatusEnum.error,
+              finishedInActiveChat,
+              targetChatTarget: currentChatTarget,
+              targetSourceKey: sourceKey,
+              targetChatId: chatId,
+              shouldUpdateChatBoxData: (state) =>
+                state.sourceKey === sourceKey && state.chatId === chatId
+            });
+          } finally {
+            chatRequestActiveRef.current = false;
+            if (autoTTSResponse) {
+              finishSegmentedAudio();
+            }
+          }
+        },
+        () => {}
+      )();
+    }
+  );
+
+  return {
+    abortRequest,
+    flushGeneratingMessages: flushGeneratingMessageQueue,
+    generatingMessage,
+    sendPrompt
+  };
+};
