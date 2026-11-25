@@ -78,20 +78,16 @@ async function handler(
     );
 
   const userForLock = await MongoUser.findOne({ username }, { _id: 1 }).lean();
-  const loginResult = userForLock
-    ? await withUserLock(String(userForLock._id), runLogin)
-    : await runLogin();
-
-  if ('status' in loginResult) {
-    return loginResult;
-  }
-
-  return finishPasswordLogin({
-    ...loginResult,
-    username,
-    req,
-    res
-  });
+  /**
+   * 创建会话也在同一用户锁内完成，避免管理员撤销会话、改密后，
+   * 一个此前已验证旧密码的登录请求才补写新的会话。
+   */
+  const runAndFinish = async () => {
+    const loginResult = await runLogin();
+    if ('status' in loginResult) return loginResult;
+    return finishPasswordLogin({ ...loginResult, username, req, res });
+  };
+  return userForLock ? withUserLock(String(userForLock._id), runAndFinish) : runAndFinish();
 }
 
 export default NextAPI(handler);
