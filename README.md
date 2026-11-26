@@ -1,3 +1,5 @@
+> 云枢团队改造版：使用 `yunshu-team` 分支，账号、共享工作流、技能/MCP 权限及可选沙盒说明见 [TEAM_README.md](TEAM_README.md)。以下保留官方项目介绍与版权信息。
+
 <div align="center">
 
 <a href="https://fastgpt.io/?source=github&utm_source=github&utm_medium=referral&utm_campaign=github_home&utm_content=logo"><img src="/.github/imgs/logo.svg" width="120" height="120" alt="fastgpt logo"></a>
