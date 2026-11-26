@@ -391,6 +391,9 @@ export const serviceEnv = createEnv({
     DISABLE_CACHE: BoolSchema.default(false).meta({
       description: '是否禁用系统内存缓存'
     }),
+    YUNSHU_TEAM_COLLABORATION_ENABLED: BoolSchema.default(false).meta({
+      description: '仅绑定的云枢内部团队启用全员图谱管理与共享应用编辑'
+    }),
     DEFAULT_TEAM_BASIC_PERMISSIONS_ENABLED: BoolSchema.default(false).meta({
       description: '新建团队时是否为默认全员组授予应用、Skill、知识库和 API Key 创建权限'
     }),

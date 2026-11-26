@@ -29,6 +29,12 @@ import {
   getActiveAccountCancellationsByTeamIds
 } from '../account/cancellation';
 import { createTeamDefaultGroup } from '../../permission/memberGroup/teamDefaultGroup';
+import { isYunshuCollaborationTeam } from '../../yunshu/collaborationPolicy';
+import {
+  TeamManageRoleVal,
+  TeamAppCreateRoleVal
+} from '@fastgpt/global/support/permission/user/constant';
+import { sumPer } from '@fastgpt/global/support/permission/utils';
 
 const logger = getLogger(LogCategories.MODULE.USER.TEAM);
 
@@ -52,13 +58,21 @@ async function getTeamMember(
 
   const [cancellation] = await getActiveAccountCancellationsByTeamIds([String(tmb.teamId)]);
 
-  const role =
+  const storedRole =
     (await getTmbPermission({
       resourceType: PerResourceTypeEnum.team,
       teamId: tmb.teamId,
       tmbId: tmb._id,
       session
     })) ?? TeamDefaultRoleVal;
+  // 账号仍为独立成员；只提升指定团队内活跃真人成员的协作能力，绝不赋予 owner/root。
+  const role =
+    isYunshuCollaborationTeam(String(tmb.teamId)) &&
+    tmb.status === TeamMemberStatusEnum.active &&
+    global.agentUserTmbIds !== undefined &&
+    !global.agentUserTmbIds.has(String(tmb._id))
+      ? sumPer(storedRole, TeamManageRoleVal, TeamAppCreateRoleVal)
+      : storedRole;
 
   return {
     userId: String(tmb.userId),

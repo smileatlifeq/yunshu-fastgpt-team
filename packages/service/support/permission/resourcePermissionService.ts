@@ -20,8 +20,10 @@ import {
 } from './resourcePermissionPolicy';
 import {
   checkRoleUpdateConflict,
-  getCollaboratorId
+  getCollaboratorId,
+  sumPer
 } from '@fastgpt/global/support/permission/utils';
+import { getYunshuSharedCollaborator } from '../yunshu/collaborationPolicy';
 
 type ResourceModel = Model<any>;
 
@@ -166,6 +168,22 @@ export const createResourcePermissions = async ({
     parentCollaborators,
     childCollaborators: [{ tmbId, permission: OwnerRoleVal }]
   });
+
+  const shared = await getYunshuSharedCollaborator({
+    teamId: String(resource.teamId),
+    resourceType,
+    ownerTmbId: tmbId,
+    session
+  });
+  if (shared) {
+    // 个人 ACL 优先于组：继承的个人读取记录也需补上共享权限，owner 保持原值。
+    for (const collaborator of collaborators) {
+      collaborator.permission = sumPer(collaborator.permission, shared.permission)!;
+    }
+    const existing = collaborators.find((item) => item.groupId === shared.groupId);
+    if (existing) existing.permission = sumPer(existing.permission, shared.permission)!;
+    else collaborators.push(shared);
+  }
 
   await resourcePermissionRepo.replaceResource({
     teamId: resource.teamId,

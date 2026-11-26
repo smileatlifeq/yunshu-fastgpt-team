@@ -39,6 +39,7 @@ const YunshuAccounts = () => {
   const [message, setMessage] = useState('正在检查登录和配置…');
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
+  const [collaboration, setCollaboration] = useState(false);
   const [nextAfterId, setNextAfterId] = useState<string | null>(null);
   const [resetPasswords, setResetPasswords] = useState<Record<string, string>>({});
 
@@ -58,9 +59,15 @@ const YunshuAccounts = () => {
       }
       const result = await GET<YunshuListResponse>('/yunshu/accounts', { limit: 100 });
       setAccounts(result.items);
+      const collaborationState = await GET<{ enabled: boolean }>('/yunshu/collaboration');
+      setCollaboration(collaborationState.enabled);
       setNextAfterId(result.nextAfterId);
       setReady(true);
-      setMessage('root 负责账号管理；图谱管理员各自登录后进入图谱工作台。');
+      setMessage(
+        collaborationState.enabled
+          ? '全员协作已开启：本团队活跃成员均可管理图谱、编辑共享工作流。root 负责账号维护。'
+          : 'root 负责账号管理；图谱管理员各自登录后进入图谱工作台。'
+      );
     } catch {
       setAccounts([]);
       setNextAfterId(null);
@@ -157,6 +164,33 @@ const YunshuAccounts = () => {
       </HStack>
       <Text my={4}>{message}</Text>
       {team !== '' && <Text fontSize="sm">内部团队 ID：{team}</Text>}
+      {collaboration && (
+        <VStack align="stretch" my={4}>
+          <Text>
+            共享应用包含保存和发布权限。新建应用自动共享；基础角色不再限制本团队的协作能力。停用账号仍立即阻断访问。
+          </Text>
+          <Button
+            isDisabled={busy || !ready}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                const result = await POST<{ apps: number; datasets: number }>(
+                  '/yunshu/collaboration'
+                );
+                setMessage(
+                  `权限已同步：${result.apps} 个共享应用、${result.datasets} 个配套知识库。成员刷新页面后可使用。`
+                );
+              } catch {
+                setMessage('权限同步未完成，请刷新后重试。');
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            同步现有共享应用权限
+          </Button>
+        </VStack>
+      )}
       <VStack align="stretch" my={6} opacity={ready ? 1 : 0.6}>
         <Input
           placeholder="账号，例如 yunshu_admin_01"
@@ -176,6 +210,7 @@ const YunshuAccounts = () => {
           onChange={(event) => setPassword(event.target.value)}
         />
         <Select
+          isDisabled={collaboration}
           value={role}
           onChange={(event) => setRole(YunshuRoleSchema.parse(event.target.value))}
         >
@@ -206,7 +241,13 @@ const YunshuAccounts = () => {
             <Tr key={account.userId}>
               <Td>{account.username}</Td>
               <Td>{account.name}</Td>
-              <Td>{account.role === 'project_admin' ? '图谱管理员' : '查询用户'}</Td>
+              <Td>
+                {collaboration
+                  ? '团队协作成员'
+                  : account.role === 'project_admin'
+                    ? '图谱管理员'
+                    : '查询用户'}
+              </Td>
               <Td>{account.enabled ? '启用' : '停用'}</Td>
               <Td>
                 <HStack>
@@ -217,17 +258,19 @@ const YunshuAccounts = () => {
                   >
                     {account.enabled ? '停用' : '启用'}
                   </Button>
-                  <Button
-                    size="sm"
-                    isDisabled={busy}
-                    onClick={() =>
-                      void update(account, {
-                        role: account.role === 'project_admin' ? 'query_user' : 'project_admin'
-                      })
-                    }
-                  >
-                    切换角色
-                  </Button>
+                  {!collaboration && (
+                    <Button
+                      size="sm"
+                      isDisabled={busy}
+                      onClick={() =>
+                        void update(account, {
+                          role: account.role === 'project_admin' ? 'query_user' : 'project_admin'
+                        })
+                      }
+                    >
+                      切换角色
+                    </Button>
+                  )}
                 </HStack>
                 <HStack mt={2}>
                   <Input

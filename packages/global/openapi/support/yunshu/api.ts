@@ -94,3 +94,13 @@ export const YunshuTeamResponseSchema = z
     })
   })
   .strict();
+
+export const YunshuCollaborationResponseSchema = z
+  .object({
+    enabled: z.boolean().meta({ description: '指定内部团队是否启用全员协作', example: true }),
+    apps: IntSchema.min(0).optional().meta({ description: '本次同步的共享应用数量', example: 2 }),
+    datasets: IntSchema.min(0)
+      .optional()
+      .meta({ description: '本次同步的配套知识库数量', example: 1 })
+  })
+  .strict();
