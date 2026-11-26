@@ -1,4 +1,4 @@
-> 本仓库由 **smileatlifeq** 维护，专供团队部署，使用唯一的 `main` 分支。部署、账号、共享工作流、技能/MCP 权限及可选沙盒说明见 [TEAM_README.md](TEAM_README.md)。以下保留官方项目介绍与版权信息。
+> 本仓库专供团队部署，使用唯一的 `main` 分支。部署、账号、共享工作流、技能/MCP 权限及可选沙盒说明见 [TEAM_README.md](TEAM_README.md)。以下保留官方项目介绍与版权信息。
 
 <div align="center">
 
