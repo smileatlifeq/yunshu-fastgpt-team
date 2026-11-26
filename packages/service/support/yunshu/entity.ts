@@ -19,6 +19,7 @@ import {
 import {
   YunshuAccountMetaSchema,
   defaultYunshuDevelopmentPermissions,
+  legacyYunshuDevelopmentPermissions,
   type YunshuRole,
   type YunshuDevelopmentPermissions
 } from '@fastgpt/global/support/yunshu/type';
@@ -74,7 +75,8 @@ export const createYunshuRepository = (): YunshuRepository => {
         member === null ||
         acl === null ||
         member.role === 'owner' ||
-        acl.permission !== yunshuRoleValue(meta.role, meta.permissions)
+        acl.permission !==
+          yunshuRoleValue(meta.role, meta.permissions ?? legacyYunshuDevelopmentPermissions)
       ) {
         throw new YunshuAccountError(409, 'INVALID_BINDING', '账号成员或权限绑定异常');
       }
@@ -87,7 +89,7 @@ export const createYunshuRepository = (): YunshuRepository => {
           teamId,
           tmbId: meta.tmbId,
           role: meta.role,
-          permissions: meta.permissions ?? { ...defaultYunshuDevelopmentPermissions },
+          permissions: meta.permissions ?? { ...legacyYunshuDevelopmentPermissions },
           enabled:
             user.status === UserStatusEnum.active && member.status === TeamMemberStatusEnum.active,
           revision: meta.revision,
@@ -198,7 +200,7 @@ export const createYunshuRepository = (): YunshuRepository => {
         const { meta, view } = record;
         const role = body.role ?? meta.role;
         const permissions =
-          body.permissions ?? meta.permissions ?? defaultYunshuDevelopmentPermissions;
+          body.permissions ?? meta.permissions ?? legacyYunshuDevelopmentPermissions;
         const updated = await MongoUser.updateOne(
           {
             _id: view.userId,

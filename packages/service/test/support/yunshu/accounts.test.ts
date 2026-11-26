@@ -10,7 +10,7 @@ import {
   YunshuUpdateBodySchema
 } from '@fastgpt/global/openapi/support/yunshu/api';
 import { YunshuAccountViewSchema } from '@fastgpt/global/support/yunshu/type';
-import { createYunshuRepository } from '@fastgpt/service/support/yunshu/entity';
+import { createYunshuRepository, yunshuRoleValue } from '@fastgpt/service/support/yunshu/entity';
 import {
   createYunshuAccount,
   listYunshuAccounts,
@@ -75,6 +75,10 @@ describe('云枢内部账号事务与权限', () => {
     const acl = await MongoResourcePermission.findOne({ tmbId: account.tmbId }).lean();
     expect(member?.role).not.toBe('owner');
     expect(new TeamPermission({ role: acl!.permission }).hasManagePer).toBe(true);
+    expect(account.permissions).toEqual({ skills: true, mcp: true });
+    expect(new TeamPermission({ role: acl!.permission }).hasSkillCreatePer).toBe(true);
+    expect(new TeamPermission({ role: acl!.permission }).hasMcpCreatePer).toBe(true);
+    expect(new TeamPermission({ role: acl!.permission }).hasApikeyCreatePer).toBe(false);
     expect(YunshuAccountViewSchema.parse(account)).toEqual(account);
     expect(JSON.stringify(account)).not.toContain('password');
     expect(String(user?.lastLoginTmbId)).toBe(account.tmbId);
@@ -83,7 +87,11 @@ describe('云枢内部账号事务与权限', () => {
   });
 
   it('独立授予技能和MCP开发；不授API密钥，撤销失败不提交，收回后不保留旧角色位', async () => {
-    const account = await createYunshuAccount({ repository, actor, body });
+    const account = await createYunshuAccount({
+      repository,
+      actor,
+      body: { ...body, permissions: { skills: false, mcp: false } }
+    });
     const revoke = vi.spyOn(repository, 'revokeSessions').mockResolvedValue(undefined);
     const granted = await updateYunshuAccount({
       repository,
@@ -119,6 +127,26 @@ describe('云枢内部账号事务与权限', () => {
     const revokedAcl = await MongoResourcePermission.findOne({ tmbId: account.tmbId }).lean();
     expect(new TeamPermission({ role: revokedAcl!.permission }).hasMcpCreatePer).toBe(false);
     expect(new TeamPermission({ role: revokedAcl!.permission }).hasSkillCreatePer).toBe(false);
+  });
+
+  it('旧账号缺少权限字段仍按旧 ACL 读取；改名不扩权，显式关闭的新账号不被默认值覆盖', async () => {
+    const permissions = { skills: false, mcp: false };
+    const account = await createYunshuAccount({ repository, actor, body: { ...body, permissions } });
+    expect(account.permissions).toEqual(permissions);
+    await MongoUser.updateOne({ _id: account.userId }, { $unset: { 'meta.yunshu.permissions': '' } });
+    await MongoResourcePermission.updateOne(
+      { tmbId: account.tmbId },
+      { permission: yunshuRoleValue(body.role, permissions) }
+    );
+    const listed = await listYunshuAccounts({ repository, actor, query: { limit: 10 } });
+    expect(listed.items[0].permissions).toEqual(permissions);
+    const renamed = await updateYunshuAccount({
+      repository,
+      actor,
+      userId: account.userId,
+      body: { expectedRevision: 1, name: '保留旧授权' }
+    });
+    expect(renamed.permissions).toEqual(permissions);
   });
 
   it('成员创建失败回滚，重复用户名不留下额外成员或 ACL', async () => {

@@ -16,8 +16,14 @@ export const YunshuDevelopmentPermissionsSchema = z
   .strict();
 export type YunshuDevelopmentPermissions = z.infer<typeof YunshuDevelopmentPermissionsSchema>;
 
-/** 旧账号保持原授权，由 root 显式启用新增能力；不能在升级时暗中扩大权限。 */
+/** 新建内部成员默认共同开发；root 仍可分别关闭，显式关闭不会被默认值覆盖。 */
 export const defaultYunshuDevelopmentPermissions: YunshuDevelopmentPermissions = {
+  skills: true,
+  mcp: true
+};
+
+/** 旧版未保存权限字段时按真实旧 ACL 读取，升级启用须经带版本的账号接口。 */
+export const legacyYunshuDevelopmentPermissions: YunshuDevelopmentPermissions = {
   skills: false,
   mcp: false
 };
@@ -55,7 +61,7 @@ export const YunshuAccountViewSchema = z
     teamId: YunshuIdSchema,
     tmbId: YunshuIdSchema,
     role: YunshuRoleSchema,
-    permissions: YunshuDevelopmentPermissionsSchema.default(defaultYunshuDevelopmentPermissions),
+    permissions: YunshuDevelopmentPermissionsSchema.default(legacyYunshuDevelopmentPermissions),
     enabled: z.boolean().meta({ description: '用户和团队成员均处于启用状态', example: true }),
     revision: z.number().int().positive().meta({ description: '账号修改版本', example: 1 }),
     createdAt: z.iso

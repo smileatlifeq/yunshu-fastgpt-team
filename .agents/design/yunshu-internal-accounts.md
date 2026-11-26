@@ -185,8 +185,20 @@ pnpm --filter @fastgpt/app build
 
 ### 8. 2026-11-26 技能与 MCP 细粒度开发权限接续
 
+> 本节记录第一版实现。新建账号默认值和后续真实验收以第 9 节为准。
+
 本轮在 yunshu-internal-accounts 分支完成技能与 MCP 权限收口，并保存为本地提交。账号元数据新增 permissions.skills 与 permissions.mcp，由 root 在 /yunshu 创建或单独修改；二者默认关闭，不扩展 API key、模型、root 或 owner 权限。技能权限沿原技能 ACL 读取/写入校验，撤权后保留已共享技能的读取但禁止借旧 ACL 写入；协作同步覆盖指定团队的个人技能。MCP 仅允许指定团队真人成员共同维护普通服务，系统 Agent、代理授权和其他团队保持原边界，列表与单项鉴权共用归属过滤。
 
 本轮新增/修改的代码与验证清单见 E:/work/graphrag_plugin/project_checkpoints/fastgpt_permission_extension_20261126_r1/implementation-receipt.json 和 source-sha256.json。packages/service 局部测试 18/18、账号页面测试 3/3、app TypeScript 检查和生产构建均通过，git diff --check 通过。构建提示当前 Node 版本低于声明范围，并有既有 styled-jsx/style.js 非阻断警告。
 
 当前仍未重启本机 FastGPT 运行时做两个独立成员的真实技能/MCP 登录与 HTTP 验收；本地提交已保存但未推送，也未发布云端；这些静态验证不能代替运行时权限验收。后续先在隔离运行时验证创建、跨成员读写、撤权、代理授权和系统 Agent 排除，再决定提交。
+
+### 9. 2026-11-26 默认开发授权与团队仓库交付
+
+按用户要求，新建内部账号的技能共同开发和普通 MCP 服务共同维护默认开启，root 仍可逐人独立关闭。显式 false 不会被默认值覆盖。旧账号缺少 permissions 字段时保留旧 ACL 对应的关闭状态；升级不能隐式扩权。本机现有三个测试成员已通过带版本的账号接口显式开启，权限改变时旧会话撤销。
+
+本机生产构建、service 类型检查、26 项局部服务测试及 3 项页面测试通过，已重启本机 3040 的 FastGPT。真实原生登录与 HTTP 已验证 root 和三个独立成员：导入技能 ZIP、跨成员读取/修改技能描述、创建及跨成员维护普通 MCP、保留原创建者；撤权后旧会话失效、共享技能仍可读但不能写、MCP 创建/修改拒绝；恢复后重新登录正常。非 root 账号管理、身份代理、错误来源与过期修改版本均被拒绝。未调用模型。
+
+浏览器已核对 root 的账号开关、新成员默认勾选、成员共享技能/MCP 列表与新建 MCP 表单；成员身份代理不可选。此前技能详情提示未配置虚拟机，当前正在追加可选官方 Agent Sandbox 配套启动器；脚本及真实执行的验收结果待补充。
+
+已逐文件确认本地快照 c44c881 与真实官方 v4.17.5 标签 e74f923690170e8f438061380b75617ecd28b5fd 完全相同。团队公开仓库基于真实官方 fork 维护，不合并无关历史。完整 FastGPT 放在 smileatlifeq/yunshu-fastgpt；图谱侧配套修改在原私有仓库另开 PR，按用户最新选择保留待同事审核，不合并 FastgptPlugins、不更新同事运行服务。

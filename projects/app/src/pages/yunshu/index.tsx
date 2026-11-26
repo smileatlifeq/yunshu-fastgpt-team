@@ -46,8 +46,7 @@ const YunshuAccounts = () => {
   const [nextAfterId, setNextAfterId] = useState<string | null>(null);
   const [resetPasswords, setResetPasswords] = useState<Record<string, string>>({});
   const [permissions, setPermissions] = useState<YunshuDevelopmentPermissions>({
-    skills: true,
-    mcp: true
+    ...defaultYunshuDevelopmentPermissions
   });
   const [permissionEdits, setPermissionEdits] = useState<
     Record<string, YunshuDevelopmentPermissions>
