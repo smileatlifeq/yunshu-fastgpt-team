@@ -27,6 +27,9 @@ const McpServer = () => {
   const { t } = useSafeTranslation();
   const { isPc } = useSystem();
   const { userInfo } = useUserStore();
+  const canManageMcp = Boolean(
+    userInfo?.permission.hasApikeyCreatePer || userInfo?.permission.hasMcpCreatePer
+  );
 
   const {
     data: mcpServerList = [],
@@ -71,7 +74,10 @@ const McpServer = () => {
                   </Box>
                 </Box>
                 <Button
-                  isDisabled={!userInfo?.permission.hasApikeyCreatePer}
+                  isDisabled={
+                    !userInfo?.permission.hasApikeyCreatePer &&
+                    !userInfo?.permission.hasMcpCreatePer
+                  }
                   onClick={() => setEditMcp(defaultForm)}
                 >
                   {t('dashboard_mcp:create_mcp_server')}
@@ -90,7 +96,10 @@ const McpServer = () => {
                 </Box>
                 <Flex mt={2} justifyContent={'flex-end'}>
                   <Button
-                    isDisabled={!userInfo?.permission.hasApikeyCreatePer}
+                    isDisabled={
+                      !userInfo?.permission.hasApikeyCreatePer &&
+                      !userInfo?.permission.hasMcpCreatePer
+                    }
                     onClick={() => setEditMcp(defaultForm)}
                   >
                     {t('dashboard_mcp:create_mcp_server')}
@@ -125,32 +134,34 @@ const McpServer = () => {
                             >
                               {t('dashboard_mcp:start_use')}
                             </Button>
-                            <MyIconButton
-                              icon="edit"
-                              onClick={() =>
-                                setEditMcp({
-                                  id: mcp._id,
-                                  name: mcp.name,
-                                  authProxy: mcp.authProxy,
-                                  apps: mcp.apps
-                                })
-                              }
-                            />
+                            <Box display={canManageMcp ? 'contents' : 'none'}>
+                              <MyIconButton
+                                icon="edit"
+                                onClick={() =>
+                                  setEditMcp({
+                                    id: mcp._id,
+                                    name: mcp.name,
+                                    authProxy: mcp.authProxy,
+                                    apps: mcp.apps
+                                  })
+                                }
+                              />
 
-                            <PopoverConfirm
-                              Trigger={
-                                <Box>
-                                  <MyIconButton
-                                    icon="delete"
-                                    hoverBg="red.50"
-                                    hoverColor={'red.600'}
-                                  />
-                                </Box>
-                              }
-                              type="delete"
-                              content={t('dashboard_mcp:delete_mcp_server_confirm_tip')}
-                              onConfirm={() => onDeleteMcpServer(mcp._id)}
-                            />
+                              <PopoverConfirm
+                                Trigger={
+                                  <Box>
+                                    <MyIconButton
+                                      icon="delete"
+                                      hoverBg="red.50"
+                                      hoverColor={'red.600'}
+                                    />
+                                  </Box>
+                                }
+                                type="delete"
+                                content={t('dashboard_mcp:delete_mcp_server_confirm_tip')}
+                                onConfirm={() => onDeleteMcpServer(mcp._id)}
+                              />
+                            </Box>
                           </HStack>
                         </Td>
                       </Tr>

@@ -15,7 +15,8 @@ import {
   Th,
   Td,
   Link,
-  Image
+  Image,
+  Checkbox
 } from '@chakra-ui/react';
 import { GET, POST } from '@/web/common/api/request';
 import { LOGO_ICON } from '@fastgpt/global/common/system/constants';
@@ -24,7 +25,9 @@ import { checkPasswordRule } from '@fastgpt/global/common/string/password';
 import {
   YunshuRoleSchema,
   type YunshuAccountView,
-  type YunshuRole
+  type YunshuRole,
+  type YunshuDevelopmentPermissions,
+  defaultYunshuDevelopmentPermissions
 } from '@fastgpt/global/support/yunshu/type';
 import type { YunshuListResponse } from '@fastgpt/global/openapi/support/yunshu/api';
 
@@ -42,6 +45,13 @@ const YunshuAccounts = () => {
   const [collaboration, setCollaboration] = useState(false);
   const [nextAfterId, setNextAfterId] = useState<string | null>(null);
   const [resetPasswords, setResetPasswords] = useState<Record<string, string>>({});
+  const [permissions, setPermissions] = useState<YunshuDevelopmentPermissions>({
+    skills: true,
+    mcp: true
+  });
+  const [permissionEdits, setPermissionEdits] = useState<
+    Record<string, YunshuDevelopmentPermissions>
+  >({});
 
   /** 刷新当前已配置团队的专用账号，不从浏览器传入团队或管理角色。 */
   const refresh = async () => {
@@ -59,6 +69,7 @@ const YunshuAccounts = () => {
       }
       const result = await GET<YunshuListResponse>('/yunshu/accounts', { limit: 100 });
       setAccounts(result.items);
+      setPermissionEdits({});
       const collaborationState = await GET<{ enabled: boolean }>('/yunshu/collaboration');
       setCollaboration(collaborationState.enabled);
       setNextAfterId(result.nextAfterId);
@@ -104,7 +115,13 @@ const YunshuAccounts = () => {
     }
     setBusy(true);
     try {
-      await POST('/yunshu/accounts', { username, name, password: hashStr(password), role });
+      await POST('/yunshu/accounts', {
+        username,
+        name,
+        password: hashStr(password),
+        role,
+        permissions
+      });
       setPassword('');
       setUsername('');
       setName('');
@@ -167,18 +184,19 @@ const YunshuAccounts = () => {
       {collaboration && (
         <VStack align="stretch" my={4}>
           <Text>
-            共享应用包含保存和发布权限。新建应用自动共享；基础角色不再限制本团队的协作能力。停用账号仍立即阻断访问。
+            图谱和共享工作流向本团队活跃成员开放；技能和 MCP
+            的创建、共同维护权限由下方逐人设置。停用账号仍立即阻断访问。
           </Text>
           <Button
             isDisabled={busy || !ready}
             onClick={async () => {
               setBusy(true);
               try {
-                const result = await POST<{ apps: number; datasets: number }>(
+                const result = await POST<{ apps: number; datasets: number; skills: number }>(
                   '/yunshu/collaboration'
                 );
                 setMessage(
-                  `权限已同步：${result.apps} 个共享应用、${result.datasets} 个配套知识库。成员刷新页面后可使用。`
+                  `权限已同步：${result.apps} 个共享应用、${result.datasets} 个配套知识库、${result.skills} 个共享技能。成员重新登录后可使用。`
                 );
               } catch {
                 setMessage('权限同步未完成，请刷新后重试。');
@@ -187,7 +205,7 @@ const YunshuAccounts = () => {
               }
             }}
           >
-            同步现有共享应用权限
+            同步现有应用和技能共享权限
           </Button>
         </VStack>
       )}
@@ -217,6 +235,27 @@ const YunshuAccounts = () => {
           <option value="project_admin">图谱管理员</option>
           <option value="query_user">查询用户</option>
         </Select>
+        <Text fontWeight="bold">新成员开发权限</Text>
+        <Checkbox
+          isChecked={permissions.skills}
+          onChange={(event) =>
+            setPermissions((current) => ({ ...current, skills: event.target.checked }))
+          }
+        >
+          技能共同开发
+        </Checkbox>
+        <Checkbox
+          isChecked={permissions.mcp}
+          onChange={(event) =>
+            setPermissions((current) => ({ ...current, mcp: event.target.checked }))
+          }
+        >
+          MCP 服务共同维护
+        </Checkbox>
+        <Text fontSize="sm" color="gray.600">
+          技能权限包含创建和修改共享技能；MCP 权限包含创建和维护本团队普通服务，不开放 API
+          密钥管理或代理授权。权限保存后，成员需要重新登录。
+        </Text>
         <HStack>
           <Button isDisabled={busy || !ready} onClick={() => void create()}>
             创建账号
@@ -226,75 +265,139 @@ const YunshuAccounts = () => {
           </Button>
         </HStack>
       </VStack>
-      <Table>
-        <Thead>
-          <Tr>
-            <Th>账号</Th>
-            <Th>成员名称</Th>
-            <Th>角色</Th>
-            <Th>状态</Th>
-            <Th>管理</Th>
-          </Tr>
-        </Thead>
-        <Tbody>
-          {accounts.map((account) => (
-            <Tr key={account.userId}>
-              <Td>{account.username}</Td>
-              <Td>{account.name}</Td>
-              <Td>
-                {collaboration
-                  ? '团队协作成员'
-                  : account.role === 'project_admin'
-                    ? '图谱管理员'
-                    : '查询用户'}
-              </Td>
-              <Td>{account.enabled ? '启用' : '停用'}</Td>
-              <Td>
-                <HStack>
-                  <Button
-                    size="sm"
-                    isDisabled={busy}
-                    onClick={() => void update(account, { enabled: !account.enabled })}
-                  >
-                    {account.enabled ? '停用' : '启用'}
-                  </Button>
-                  {!collaboration && (
+      <Box overflowX="auto">
+        <Table>
+          <Thead>
+            <Tr>
+              <Th>账号</Th>
+              <Th>成员名称</Th>
+              <Th>角色</Th>
+              <Th>状态</Th>
+              <Th>开发权限</Th>
+              <Th>管理</Th>
+            </Tr>
+          </Thead>
+          <Tbody>
+            {accounts.map((account) => (
+              <Tr key={account.userId}>
+                <Td>{account.username}</Td>
+                <Td>{account.name}</Td>
+                <Td>
+                  {collaboration
+                    ? '团队协作成员'
+                    : account.role === 'project_admin'
+                      ? '图谱管理员'
+                      : '查询用户'}
+                </Td>
+                <Td>{account.enabled ? '启用' : '停用'}</Td>
+                <Td minW="240px">
+                  <VStack align="start">
+                    <Checkbox
+                      aria-label={`${account.username}技能共同开发`}
+                      isDisabled={busy}
+                      isChecked={
+                        (
+                          permissionEdits[account.userId] ??
+                          account.permissions ??
+                          defaultYunshuDevelopmentPermissions
+                        ).skills
+                      }
+                      onChange={(event) =>
+                        setPermissionEdits((current) => ({
+                          ...current,
+                          [account.userId]: {
+                            ...(current[account.userId] ??
+                              account.permissions ??
+                              defaultYunshuDevelopmentPermissions),
+                            skills: event.target.checked
+                          }
+                        }))
+                      }
+                    >
+                      技能共同开发
+                    </Checkbox>
+                    <Checkbox
+                      aria-label={`${account.username}MCP服务共同维护`}
+                      isDisabled={busy}
+                      isChecked={
+                        (
+                          permissionEdits[account.userId] ??
+                          account.permissions ??
+                          defaultYunshuDevelopmentPermissions
+                        ).mcp
+                      }
+                      onChange={(event) =>
+                        setPermissionEdits((current) => ({
+                          ...current,
+                          [account.userId]: {
+                            ...(current[account.userId] ??
+                              account.permissions ??
+                              defaultYunshuDevelopmentPermissions),
+                            mcp: event.target.checked
+                          }
+                        }))
+                      }
+                    >
+                      MCP 服务共同维护
+                    </Checkbox>
+                    <Button
+                      size="sm"
+                      isDisabled={busy || !permissionEdits[account.userId]}
+                      onClick={() =>
+                        void update(account, { permissions: permissionEdits[account.userId] })
+                      }
+                    >
+                      保存开发权限
+                    </Button>
+                  </VStack>
+                </Td>
+                <Td>
+                  <HStack>
                     <Button
                       size="sm"
                       isDisabled={busy}
-                      onClick={() =>
-                        void update(account, {
-                          role: account.role === 'project_admin' ? 'query_user' : 'project_admin'
-                        })
-                      }
+                      onClick={() => void update(account, { enabled: !account.enabled })}
                     >
-                      切换角色
+                      {account.enabled ? '停用' : '启用'}
                     </Button>
-                  )}
-                </HStack>
-                <HStack mt={2}>
-                  <Input
-                    type="password"
-                    size="sm"
-                    autoComplete="new-password"
-                    placeholder="新的密码"
-                    value={resetPasswords[account.userId] ?? ''}
-                    onChange={(event) =>
-                      setResetPasswords((current) => ({
-                        ...current,
-                        [account.userId]: event.target.value
-                      }))
-                    }
-                  />
-                  <Button size="sm" isDisabled={busy} onClick={() => void resetPassword(account)}>
-                    重置密码
-                  </Button>
-                </HStack>
-              </Td>
-            </Tr>
-          ))}
-        </Tbody>
-      </Table>
+                    {!collaboration && (
+                      <Button
+                        size="sm"
+                        isDisabled={busy}
+                        onClick={() =>
+                          void update(account, {
+                            role: account.role === 'project_admin' ? 'query_user' : 'project_admin'
+                          })
+                        }
+                      >
+                        切换角色
+                      </Button>
+                    )}
+                  </HStack>
+                  <HStack mt={2}>
+                    <Input
+                      type="password"
+                      size="sm"
+                      autoComplete="new-password"
+                      placeholder="新的密码"
+                      value={resetPasswords[account.userId] ?? ''}
+                      onChange={(event) =>
+                        setResetPasswords((current) => ({
+                          ...current,
+                          [account.userId]: event.target.value
+                        }))
+                      }
+                    />
+                    <Button size="sm" isDisabled={busy} onClick={() => void resetPassword(account)}>
+                      重置密码
+                    </Button>
+                  </HStack>
+                </Td>
+              </Tr>
+            ))}
+          </Tbody>
+        </Table>
+      </Box>
       {nextAfterId !== null && (
         <Button mt={4} isDisabled={busy || !ready} onClick={() => void loadMore()}>
           加载更多账号

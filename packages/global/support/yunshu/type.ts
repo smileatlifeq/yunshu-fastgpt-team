@@ -6,6 +6,22 @@ export const YunshuRoleSchema = z.enum(['project_admin', 'query_user']).meta({
 });
 export type YunshuRole = z.infer<typeof YunshuRoleSchema>;
 
+export const YunshuDevelopmentPermissionsSchema = z
+  .object({
+    skills: z.boolean().meta({ description: '创建和共同维护本团队技能' }),
+    mcp: z
+      .boolean()
+      .meta({ description: '创建和共同维护本团队普通 MCP 服务，不授予 API 密钥或代理授权管理' })
+  })
+  .strict();
+export type YunshuDevelopmentPermissions = z.infer<typeof YunshuDevelopmentPermissionsSchema>;
+
+/** 旧账号保持原授权，由 root 显式启用新增能力；不能在升级时暗中扩大权限。 */
+export const defaultYunshuDevelopmentPermissions: YunshuDevelopmentPermissions = {
+  skills: false,
+  mcp: false
+};
+
 export const YunshuIdSchema = z
   .string()
   .regex(/^[a-f0-9]{24}$/)
@@ -21,6 +37,7 @@ export const YunshuAccountMetaSchema = z
     tmbId: YunshuIdSchema,
     permissionId: YunshuIdSchema,
     role: YunshuRoleSchema,
+    permissions: YunshuDevelopmentPermissionsSchema.optional(),
     revision: z
       .number()
       .int()
@@ -38,6 +55,7 @@ export const YunshuAccountViewSchema = z
     teamId: YunshuIdSchema,
     tmbId: YunshuIdSchema,
     role: YunshuRoleSchema,
+    permissions: YunshuDevelopmentPermissionsSchema.default(defaultYunshuDevelopmentPermissions),
     enabled: z.boolean().meta({ description: '用户和团队成员均处于启用状态', example: true }),
     revision: z.number().int().positive().meta({ description: '账号修改版本', example: 1 }),
     createdAt: z.iso

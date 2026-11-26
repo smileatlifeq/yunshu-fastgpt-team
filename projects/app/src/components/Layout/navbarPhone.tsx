@@ -6,6 +6,10 @@ import { useTranslation } from 'next-i18next';
 import Badge from '../Badge';
 import MyIcon from '@fastgpt/web/components/common/Icon';
 import { useUserStore } from '@/web/support/user/useUserStore';
+import {
+  yunshuAccountNavigation,
+  type YunshuNavigationItem
+} from '@/web/support/yunshu/navigation';
 
 const NavbarPhone = ({ unread }: { unread: number }) => {
   const router = useRouter();
@@ -13,7 +17,7 @@ const NavbarPhone = ({ unread }: { unread: number }) => {
   const { t } = useTranslation();
   const { lastChatAppId, lastPane } = useChatStore();
 
-  const navbarList = useMemo(
+  const navbarList = useMemo<YunshuNavigationItem[]>(
     () => [
       {
         label: t('common:navbar.Chat'),
@@ -66,6 +70,7 @@ const NavbarPhone = ({ unread }: { unread: number }) => {
         ],
         unread
       },
+      ...yunshuAccountNavigation(userInfo?.username),
       ...(userInfo?.username === 'root'
         ? [
             {
@@ -73,6 +78,7 @@ const NavbarPhone = ({ unread }: { unread: number }) => {
               icon: 'support/config/configLight',
               activeIcon: 'support/config/configFill',
               link: '/admin/dashboard',
+              unread: 0,
               activePrefix: ['/admin'],
               activeLink: [] as string[]
             }

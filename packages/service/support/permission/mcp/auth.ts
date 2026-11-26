@@ -5,6 +5,12 @@ import { authUserPer } from '../user/auth';
 import { MongoMcpKey } from '../../mcp/schema';
 import { CommonErrEnum } from '@fastgpt/global/common/error/code/common';
 import { TeamErrEnum } from '@fastgpt/global/common/error/code/team';
+import {
+  WritePermissionVal,
+  ManagePermissionVal
+} from '@fastgpt/global/support/permission/constant';
+import { isYunshuManagedTeam } from '../../yunshu/collaborationPolicy';
+import { canManageYunshuMcp } from '../../yunshu/mcpPolicy';
 
 export const authMcp = async ({
   mcpId,
@@ -30,8 +36,17 @@ export const authMcp = async ({
     return Promise.reject(TeamErrEnum.unPermission);
   }
 
-  // MCP 发布项与个人 APIKey 一样只归创建成员管理。
-  if (tmbId !== String(mcp.tmbId)) {
+  const shared = canManageYunshuMcp({ teamId, tmbId, permission }, mcp);
+  if (tmbId !== String(mcp.tmbId) && !shared) {
+    return Promise.reject(TeamErrEnum.unPermission);
+  }
+  if (
+    isYunshuManagedTeam(teamId) &&
+    !global.agentUserTmbIds?.has(tmbId) &&
+    !permission.hasApikeyCreatePer &&
+    !permission.hasMcpCreatePer &&
+    (per & (WritePermissionVal | ManagePermissionVal)) !== 0
+  ) {
     return Promise.reject(TeamErrEnum.unPermission);
   }
 

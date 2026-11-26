@@ -12,15 +12,30 @@ import { TeamMemberStatusEnum } from '@fastgpt/global/support/user/team/constant
 import { PerResourceTypeEnum } from '@fastgpt/global/support/permission/constant';
 import {
   TeamManageRoleVal,
-  TeamReadRoleVal
+  TeamReadRoleVal,
+  TeamSkillCreateRoleVal,
+  TeamMcpCreateRoleVal
 } from '@fastgpt/global/support/permission/user/constant';
-import { YunshuAccountMetaSchema, type YunshuRole } from '@fastgpt/global/support/yunshu/type';
+import {
+  YunshuAccountMetaSchema,
+  defaultYunshuDevelopmentPermissions,
+  type YunshuRole,
+  type YunshuDevelopmentPermissions
+} from '@fastgpt/global/support/yunshu/type';
+import { sumPer } from '@fastgpt/global/support/permission/utils';
 import type { YunshuRepository, YunshuUnitOfWork } from './types';
 import { YunshuAccountError } from './utils';
 
 /** 按现有 FastGPT 角色位授予团队权限；不把每个新成员设成 owner。 */
-export const yunshuRoleValue = (role: YunshuRole) =>
-  role === 'project_admin' ? TeamManageRoleVal : TeamReadRoleVal;
+export const yunshuRoleValue = (
+  role: YunshuRole,
+  permissions: YunshuDevelopmentPermissions = defaultYunshuDevelopmentPermissions
+) =>
+  sumPer(
+    role === 'project_admin' ? TeamManageRoleVal : TeamReadRoleVal,
+    ...(permissions.skills ? [TeamSkillCreateRoleVal] : []),
+    ...(permissions.mcp ? [TeamMcpCreateRoleVal] : [])
+  )!;
 
 /** Mongo 适配器复用原生 Schema setter、事务与会话撤销机制。 */
 export const createYunshuRepository = (): YunshuRepository => {
@@ -59,7 +74,7 @@ export const createYunshuRepository = (): YunshuRepository => {
         member === null ||
         acl === null ||
         member.role === 'owner' ||
-        acl.permission !== yunshuRoleValue(meta.role)
+        acl.permission !== yunshuRoleValue(meta.role, meta.permissions)
       ) {
         throw new YunshuAccountError(409, 'INVALID_BINDING', '账号成员或权限绑定异常');
       }
@@ -72,6 +87,7 @@ export const createYunshuRepository = (): YunshuRepository => {
           teamId,
           tmbId: meta.tmbId,
           role: meta.role,
+          permissions: meta.permissions ?? { ...defaultYunshuDevelopmentPermissions },
           enabled:
             user.status === UserStatusEnum.active && member.status === TeamMemberStatusEnum.active,
           revision: meta.revision,
@@ -151,7 +167,7 @@ export const createYunshuRepository = (): YunshuRepository => {
               teamId,
               tmbId: member._id,
               resourceType: PerResourceTypeEnum.team,
-              permission: yunshuRoleValue(body.role)
+              permission: yunshuRoleValue(body.role, body.permissions)
             }
           ],
           { session, ordered: true }
@@ -167,6 +183,7 @@ export const createYunshuRepository = (): YunshuRepository => {
                 tmbId: String(member._id),
                 permissionId: String(acl._id),
                 role: body.role,
+                permissions: body.permissions ?? { ...defaultYunshuDevelopmentPermissions },
                 revision: 1
               }
             }
@@ -180,6 +197,8 @@ export const createYunshuRepository = (): YunshuRepository => {
       update: async (record, body) => {
         const { meta, view } = record;
         const role = body.role ?? meta.role;
+        const permissions =
+          body.permissions ?? meta.permissions ?? defaultYunshuDevelopmentPermissions;
         const updated = await MongoUser.updateOne(
           {
             _id: view.userId,
@@ -189,6 +208,7 @@ export const createYunshuRepository = (): YunshuRepository => {
           {
             $set: {
               'meta.yunshu.role': role,
+              'meta.yunshu.permissions': permissions,
               ...(body.enabled === undefined
                 ? {}
                 : { status: body.enabled ? UserStatusEnum.active : UserStatusEnum.forbidden }),
@@ -229,7 +249,7 @@ export const createYunshuRepository = (): YunshuRepository => {
             tmbId: meta.tmbId,
             resourceType: PerResourceTypeEnum.team
           },
-          { $set: { permission: yunshuRoleValue(role) } },
+          { $set: { permission: yunshuRoleValue(role, permissions) } },
           { session }
         );
         if (acl.matchedCount !== 1)

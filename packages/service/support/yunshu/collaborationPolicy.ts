@@ -10,12 +10,15 @@ import { MongoMemberGroupModel } from '../permission/memberGroup/memberGroupSche
 import type { CollaboratorItemType } from '@fastgpt/global/support/permission/collaborator';
 
 /** 全员协作只作用于部署明确绑定的内部团队，不改变其他团队或系统 root 权限。 */
-export const isYunshuCollaborationTeam = (teamId: string) =>
-  serviceEnv.YUNSHU_TEAM_COLLABORATION_ENABLED &&
+export const isYunshuManagedTeam = (teamId: string) =>
   /^[a-f0-9]{24}$/.test(process.env.YUNSHU_ADMIN_TEAM_ID ?? '') &&
   String(teamId) === process.env.YUNSHU_ADMIN_TEAM_ID;
 
-/** 共享应用可编辑，配套知识库可读取；系统 Agent 的私有资源保持原授权。 */
+/** 共享开关控制自动补权，不取消 root 已经保存的单个成员开发限制。 */
+export const isYunshuCollaborationTeam = (teamId: string) =>
+  serviceEnv.YUNSHU_TEAM_COLLABORATION_ENABLED && isYunshuManagedTeam(teamId);
+
+/** 共享应用及技能可编辑，配套知识库可读取；系统 Agent 的私有资源保持原授权。 */
 export const getYunshuSharedCollaborator = async ({
   teamId,
   resourceType,
@@ -28,7 +31,11 @@ export const getYunshuSharedCollaborator = async ({
   session: ClientSession;
 }): Promise<CollaboratorItemType | undefined> => {
   if (!isYunshuCollaborationTeam(teamId)) return;
-  if (resourceType !== PerResourceTypeEnum.app && resourceType !== PerResourceTypeEnum.dataset)
+  if (
+    resourceType !== PerResourceTypeEnum.app &&
+    resourceType !== PerResourceTypeEnum.dataset &&
+    resourceType !== PerResourceTypeEnum.agentSkill
+  )
     return;
   if (!global.agentUserTmbIds) throw new Error('Agent memberships are not initialized');
   if (global.agentUserTmbIds.has(String(ownerTmbId))) return;
@@ -38,6 +45,6 @@ export const getYunshuSharedCollaborator = async ({
   if (!group) throw new Error('The internal team default group is missing');
   return {
     groupId: String(group._id),
-    permission: resourceType === PerResourceTypeEnum.app ? WriteRoleVal : ReadRoleVal
+    permission: resourceType === PerResourceTypeEnum.dataset ? ReadRoleVal : WriteRoleVal
   };
 };

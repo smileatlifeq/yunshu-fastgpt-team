@@ -2,6 +2,7 @@ import type { ApiRequestProps, ApiResponseType } from '@fastgpt/next/type';
 import { NextAPI } from '@/service/middleware/entry';
 import { authUserPer } from '@fastgpt/service/support/permission/user/auth';
 import { MongoMcpKey } from '@fastgpt/service/support/mcp/schema';
+import { yunshuMcpListFilter } from '@fastgpt/service/support/yunshu/mcpPolicy';
 import {
   McpListResponseSchema,
   type McpListResponseType
@@ -11,13 +12,15 @@ async function handler(
   req: ApiRequestProps,
   _res: ApiResponseType<any>
 ): Promise<McpListResponseType> {
-  const { teamId, tmbId } = await authUserPer({
+  const { teamId, tmbId, permission } = await authUserPer({
     req,
     authToken: true,
     authApiKey: true
   });
 
-  const list = await MongoMcpKey.find({ teamId, tmbId }).lean().sort({ _id: -1 });
+  const list = await MongoMcpKey.find(yunshuMcpListFilter({ teamId, tmbId, permission }))
+    .lean()
+    .sort({ _id: -1 });
 
   return McpListResponseSchema.parse(list);
 }

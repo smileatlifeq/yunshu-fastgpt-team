@@ -1,5 +1,7 @@
 import { MongoApp } from '../../core/app/schema';
 import { MongoDataset } from '../../core/dataset/schema';
+import { MongoAgentSkills } from '../../core/ai/skill/model/schema';
+import { AgentSkillSourceEnum } from '@fastgpt/global/core/ai/skill/constants';
 import { MongoResourcePermission } from '../permission/schema';
 import { MongoMemberGroupModel } from '../permission/memberGroup/memberGroupSchema';
 import { resourcePermissionRepo } from '../permission/repository/resourcePermissionRepo';
@@ -59,10 +61,26 @@ export const synchronizeYunshuCollaboration = async ({
     )
       .session(session)
       .lean();
+    const skills = await MongoAgentSkills.find(
+      {
+        teamId: actor.teamId,
+        deleteTime: null,
+        source: AgentSkillSourceEnum.personal,
+        tmbId: { $nin: excluded }
+      },
+      '_id'
+    )
+      .session(session)
+      .lean();
     for (const entry of [
       {
         resourceType: PerResourceTypeEnum.app,
         ids: apps.map((item) => String(item._id)),
+        role: WriteRoleVal
+      },
+      {
+        resourceType: PerResourceTypeEnum.agentSkill,
+        ids: skills.map((item) => String(item._id)),
         role: WriteRoleVal
       },
       {
@@ -102,7 +120,7 @@ export const synchronizeYunshuCollaboration = async ({
         session
       });
     }
-    return { enabled: true, apps: apps.length, datasets: datasets.length };
+    return { enabled: true, apps: apps.length, datasets: datasets.length, skills: skills.length };
   });
   repository.audit({
     action: 'synchronize_collaboration',

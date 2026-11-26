@@ -13,6 +13,10 @@ import MyTooltip from '@fastgpt/web/components/common/MyTooltip';
 import { getWebReqUrl } from '@fastgpt/web/common/system/utils';
 import MyImage from '@fastgpt/web/components/common/Image/MyImage';
 import { LOGO_ICON } from '@fastgpt/global/common/system/constants';
+import {
+  yunshuAccountNavigation,
+  type YunshuNavigationItem
+} from '@/web/support/yunshu/navigation';
 
 export enum NavbarTypeEnum {
   normal = 'normal',
@@ -44,7 +48,7 @@ const Navbar = ({ unread }: { unread: number }) => {
   const { gitStar, feConfigs } = useSystemStore();
   const { lastChatAppId, lastPane } = useChatStore();
 
-  const navbarList = useMemo(
+  const navbarList = useMemo<YunshuNavigationItem[]>(
     () => [
       {
         label: t('common:navbar.Chat'),
@@ -98,6 +102,7 @@ const Navbar = ({ unread }: { unread: number }) => {
           '/account/model'
         ]
       },
+      ...yunshuAccountNavigation(userInfo?.username),
       ...(userInfo?.username === 'root'
         ? [
             {

@@ -285,6 +285,7 @@
   "permission_appCreate_tip": "Create Apps in the root directory. Folder-level creation permissions are configured separately.",
   "permission_datasetCreate": "Create Dataset",
   "permission_datasetCreate_Tip": "Create Datasets in the root directory. Folder-level creation permissions are configured separately.",
+  "permission_mcpCreate": "Create MCP service",
   "permission_skillCreate": "Create Skill",
   "permission_skillCreate_Tip": "Can create skills in the root directory (creation permissions in folders are controlled by the folder)",
   "permission_modelCreate": "Install Model",

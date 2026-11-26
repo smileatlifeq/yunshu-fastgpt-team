@@ -82,6 +82,45 @@ describe('云枢内部账号事务与权限', () => {
     expect(stored?.password).toBe(hashStr(body.password));
   });
 
+  it('独立授予技能和MCP开发；不授API密钥，撤销失败不提交，收回后不保留旧角色位', async () => {
+    const account = await createYunshuAccount({ repository, actor, body });
+    const revoke = vi.spyOn(repository, 'revokeSessions').mockResolvedValue(undefined);
+    const granted = await updateYunshuAccount({
+      repository,
+      actor,
+      userId: account.userId,
+      body: { expectedRevision: 1, permissions: { skills: true, mcp: true } }
+    });
+    expect(granted.permissions).toEqual({ skills: true, mcp: true });
+    const acl = await MongoResourcePermission.findOne({ tmbId: account.tmbId }).lean();
+    const permission = new TeamPermission({ role: acl!.permission });
+    expect(permission.hasSkillCreatePer).toBe(true);
+    expect(permission.hasMcpCreatePer).toBe(true);
+    expect(permission.hasApikeyCreatePer).toBe(false);
+    expect(permission.isOwner).toBe(false);
+    revoke.mockRejectedValueOnce(new Error('redis unavailable'));
+    await expect(
+      updateYunshuAccount({
+        repository,
+        actor,
+        userId: account.userId,
+        body: { expectedRevision: 2, permissions: { skills: false, mcp: false } }
+      })
+    ).rejects.toMatchObject({ status: 503 });
+    expect(
+      (await listYunshuAccounts({ repository, actor, query: { limit: 10 } })).items[0].permissions
+    ).toEqual({ skills: true, mcp: true });
+    await updateYunshuAccount({
+      repository,
+      actor,
+      userId: account.userId,
+      body: { expectedRevision: 2, permissions: { skills: false, mcp: false } }
+    });
+    const revokedAcl = await MongoResourcePermission.findOne({ tmbId: account.tmbId }).lean();
+    expect(new TeamPermission({ role: revokedAcl!.permission }).hasMcpCreatePer).toBe(false);
+    expect(new TeamPermission({ role: revokedAcl!.permission }).hasSkillCreatePer).toBe(false);
+  });
+
   it('成员创建失败回滚，重复用户名不留下额外成员或 ACL', async () => {
     const before = [
       await MongoUser.countDocuments(),

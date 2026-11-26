@@ -14,7 +14,8 @@ export enum TeamPerKeyEnum {
   datasetCreate = 'datasetCreate',
   apikeyCreate = 'apikeyCreate',
   skillCreate = 'skillCreate',
-  modelCreate = 'modelCreate'
+  modelCreate = 'modelCreate',
+  mcpCreate = 'mcpCreate'
 }
 
 export enum TeamRoleKeyEnum {
@@ -22,7 +23,8 @@ export enum TeamRoleKeyEnum {
   datasetCreate = 'datasetCreate',
   apikeyCreate = 'apikeyCreate',
   skillCreate = 'skillCreate',
-  modelCreate = 'modelCreate'
+  modelCreate = 'modelCreate',
+  mcpCreate = 'mcpCreate'
 }
 
 /* 团队权限位：0~2 为通用权限（管/写/读），3~7 为资源创建权限 */
@@ -32,10 +34,17 @@ export const TeamPerList: PermissionListType<TeamPerKeyEnum> = {
   datasetCreate: 0b00010000,
   apikeyCreate: 0b00100000,
   skillCreate: 0b01000000,
-  modelCreate: 0b10000000
+  modelCreate: 0b10000000,
+  mcpCreate: 0b100000000
 };
 
 export const TeamRoleList: RoleListType<TeamRoleKeyEnum> = {
+  [TeamRoleKeyEnum.mcpCreate]: {
+    checkBoxType: 'multiple',
+    description: '',
+    name: i18nT('account_team:permission_mcpCreate'),
+    value: 0b100000000
+  },
   [CommonPerKeyEnum.read]: {
     ...CommonRoleList[CommonPerKeyEnum.read],
     name: i18nT('common:permission.common_member'),
@@ -85,6 +94,10 @@ export const TeamRoleList: RoleListType<TeamRoleKeyEnum> = {
 export const TeamRolePerMap: RolePerMapType = new Map([
   ...CommonRolePerMap,
   [
+    TeamRoleList['mcpCreate'].value,
+    sumPer(TeamPerList.mcpCreate, CommonPerList.read, CommonPerList.write) as PermissionValueType
+  ],
+  [
     TeamRoleList['appCreate'].value,
     sumPer(TeamPerList.appCreate, CommonPerList.read, CommonPerList.write) as PermissionValueType
   ],
@@ -118,6 +131,7 @@ export const TeamDatasetCreateRoleVal = TeamRoleList['datasetCreate'].value;
 export const TeamApikeyCreateRoleVal = TeamRoleList['apikeyCreate'].value;
 export const TeamSkillCreateRoleVal = TeamRoleList['skillCreate'].value;
 export const TeamModelCreateRoleVal = TeamRoleList['modelCreate'].value;
+export const TeamMcpCreateRoleVal = TeamRoleList['mcpCreate'].value;
 export const TeamDefaultRoleVal = TeamReadRoleVal;
 
 export const TeamReadPermissionVal = TeamPerList.read;
@@ -128,4 +142,5 @@ export const TeamDatasetCreatePermissionVal = TeamPerList.datasetCreate;
 export const TeamApikeyCreatePermissionVal = TeamPerList.apikeyCreate;
 export const TeamSkillCreatePermissionVal = TeamPerList.skillCreate;
 export const TeamModelCreatePermissionVal = TeamPerList.modelCreate;
+export const TeamMcpCreatePermissionVal = TeamPerList.mcpCreate;
 export const TeamDefaultPermissionVal = TeamReadPermissionVal;

@@ -84,6 +84,9 @@ export const updateYunshuAccount = async ({
     });
 
     const securityChange =
+      (body.permissions !== undefined &&
+        (body.permissions.skills !== snapshot.view.permissions.skills ||
+          body.permissions.mcp !== snapshot.view.permissions.mcp)) ||
       body.newPassword !== undefined ||
       (body.role !== undefined && body.role !== snapshot.view.role) ||
       (body.enabled !== undefined && body.enabled !== snapshot.view.enabled);

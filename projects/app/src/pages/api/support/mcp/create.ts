@@ -19,7 +19,7 @@ async function handler(req: ApiRequestProps): Promise<McpCreateResponseType> {
     authApiKey: true
   });
 
-  if (!permission.hasApikeyCreatePer) {
+  if (!permission.hasApikeyCreatePer && !permission.hasMcpCreatePer) {
     return Promise.reject(TeamErrEnum.unPermission);
   }
 

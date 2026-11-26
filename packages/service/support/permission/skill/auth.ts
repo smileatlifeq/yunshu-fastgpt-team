@@ -3,7 +3,13 @@ import { AgentSkillSourceEnum, AgentSkillTypeEnum } from '@fastgpt/global/core/a
 import type { AgentSkillSchemaType } from '@fastgpt/global/core/ai/skill/type';
 import { SkillErrEnum } from '@fastgpt/global/common/error/code/skill';
 import { SkillPermission } from '@fastgpt/global/support/permission/skill/controller';
-import { PerResourceTypeEnum, ReadRoleVal } from '@fastgpt/global/support/permission/constant';
+import {
+  PerResourceTypeEnum,
+  ReadRoleVal,
+  WritePermissionVal,
+  ManagePermissionVal
+} from '@fastgpt/global/support/permission/constant';
+import { isYunshuSkillReadOnly, yunshuSkillViewPermission } from '../../yunshu/skillPolicy';
 import type { PermissionValueType } from '@fastgpt/global/support/permission/type';
 import type { AuthModeType, AuthResponseType } from '../type';
 import { getTmbInfoByTmbId } from '../../user/team/controller';
@@ -76,6 +82,15 @@ export const authSkillByTmbId = async ({
       return Promise.reject(SkillErrEnum.unAuthSkill);
     }
 
+    // 收回“技能共同开发”后，即使旧的共享 ACL 仍存在，也不能继续写入。
+    // 读取和工作流引用仍沿用原 ACL；系统技能及其他团队不受此内部策略影响。
+    if (
+      isYunshuSkillReadOnly(teamId, tmbId, tmbPer) &&
+      (per & (WritePermissionVal | ManagePermissionVal)) !== 0
+    ) {
+      return Promise.reject(SkillErrEnum.unAuthSkill);
+    }
+
     // Check if should inherit permission from parent folder
     const isOwner = tmbPer.isOwner || String(skill.tmbId) === String(tmbId);
     const isGetParentClb =
@@ -100,10 +115,15 @@ export const authSkillByTmbId = async ({
     ]);
 
     // 父级 owner 在子级只能是 manage；物化快照已含父级贡献，这里只兜底历史缺失快照。
-    const Per = new SkillPermission({
-      role: sumPer(toInheritedPermissionValue(folderPer), myPer),
-      isOwner
-    });
+    const Per = yunshuSkillViewPermission(
+      teamId,
+      tmbId,
+      tmbPer,
+      new SkillPermission({
+        role: sumPer(toInheritedPermissionValue(folderPer), myPer),
+        isOwner
+      })
+    );
 
     if (!Per.checkPer(per)) {
       return Promise.reject(SkillErrEnum.unAuthSkill);

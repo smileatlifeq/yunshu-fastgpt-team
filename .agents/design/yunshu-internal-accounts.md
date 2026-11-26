@@ -182,3 +182,11 @@ pnpm --filter @fastgpt/app build
 本机 Windows 根测试包装器曾出现 `spawn pnpm ENOENT`；可直接用拥有相同配置的 workspace 命令，不为了测试修改全局 PATH。app 类型检查需要约 4 GiB Node 堆空间；实际使用的 Node/pnpm 应以当前目标版本的 package.json 为准。
 
 升级完成后，补充目标官方版本/commit、合并提交、冲突解决位置、新测试结果和发布结果到本文件；下一轮继续沿同一维护分支记录。
+
+### 8. 2026-11-26 技能与 MCP 细粒度开发权限接续
+
+本轮在 yunshu-internal-accounts 分支完成技能与 MCP 权限收口，并保存为本地提交。账号元数据新增 permissions.skills 与 permissions.mcp，由 root 在 /yunshu 创建或单独修改；二者默认关闭，不扩展 API key、模型、root 或 owner 权限。技能权限沿原技能 ACL 读取/写入校验，撤权后保留已共享技能的读取但禁止借旧 ACL 写入；协作同步覆盖指定团队的个人技能。MCP 仅允许指定团队真人成员共同维护普通服务，系统 Agent、代理授权和其他团队保持原边界，列表与单项鉴权共用归属过滤。
+
+本轮新增/修改的代码与验证清单见 E:/work/graphrag_plugin/project_checkpoints/fastgpt_permission_extension_20261126_r1/implementation-receipt.json 和 source-sha256.json。packages/service 局部测试 18/18、账号页面测试 3/3、app TypeScript 检查和生产构建均通过，git diff --check 通过。构建提示当前 Node 版本低于声明范围，并有既有 styled-jsx/style.js 非阻断警告。
+
+当前仍未重启本机 FastGPT 运行时做两个独立成员的真实技能/MCP 登录与 HTTP 验收；本地提交已保存但未推送，也未发布云端；这些静态验证不能代替运行时权限验收。后续先在隔离运行时验证创建、跨成员读写、撤权、代理授权和系统 Agent 排除，再决定提交。

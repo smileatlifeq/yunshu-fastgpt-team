@@ -3,7 +3,8 @@ import { IntSchema } from '../../../common/zod';
 import {
   YunshuAccountViewSchema,
   YunshuIdSchema,
-  YunshuRoleSchema
+  YunshuRoleSchema,
+  YunshuDevelopmentPermissionsSchema
 } from '../../../support/yunshu/type';
 
 const passwordDigest = z
@@ -41,7 +42,8 @@ export const YunshuCreateBodySchema = z
       .max(80)
       .meta({ description: '成员显示名称', example: '云枢图谱·管理员01' }),
     password: passwordDigest,
-    role: YunshuRoleSchema
+    role: YunshuRoleSchema,
+    permissions: YunshuDevelopmentPermissionsSchema.optional()
   })
   .strict();
 export type YunshuCreateBody = z.infer<typeof YunshuCreateBodySchema>;
@@ -59,6 +61,7 @@ export const YunshuUpdateBodySchema = z
       }),
     name: z.string().trim().min(1).max(80).optional().meta({ description: '新的成员显示名称' }),
     role: YunshuRoleSchema.optional(),
+    permissions: YunshuDevelopmentPermissionsSchema.optional(),
     // 权限相关停用字段严格拒绝字符串和数字，避免真假值解释不同。
     enabled: z
       .boolean()
@@ -71,6 +74,7 @@ export const YunshuUpdateBodySchema = z
     (body) =>
       body.name !== undefined ||
       body.role !== undefined ||
+      body.permissions !== undefined ||
       body.enabled !== undefined ||
       body.newPassword !== undefined,
     '至少提供一个修改字段'
@@ -101,6 +105,9 @@ export const YunshuCollaborationResponseSchema = z
     apps: IntSchema.min(0).optional().meta({ description: '本次同步的共享应用数量', example: 2 }),
     datasets: IntSchema.min(0)
       .optional()
-      .meta({ description: '本次同步的配套知识库数量', example: 1 })
+      .meta({ description: '本次同步的配套知识库数量', example: 1 }),
+    skills: IntSchema.min(0)
+      .optional()
+      .meta({ description: '本次同步的共享技能与目录数量', example: 1 })
   })
   .strict();

@@ -12,6 +12,12 @@ import { authAppByTmbId } from '@fastgpt/service/support/permission/app/auth';
 import { createResourcePermissions } from '@fastgpt/service/support/permission/resourcePermissionService';
 import { createYunshuRepository } from '@fastgpt/service/support/yunshu/entity';
 import { synchronizeYunshuCollaboration } from '@fastgpt/service/support/yunshu/collaboration';
+import { MongoAgentSkills } from '@fastgpt/service/core/ai/skill/model/schema';
+import { authSkillByTmbId } from '@fastgpt/service/support/permission/skill/auth';
+import {
+  TeamSkillCreateRoleVal,
+  TeamReadRoleVal
+} from '@fastgpt/global/support/permission/user/constant';
 import { mongoSessionRun } from '@fastgpt/service/common/mongo/sessionRun';
 import { DefaultGroupName } from '@fastgpt/global/support/user/team/group/constant';
 import { AppTypeEnum } from '@fastgpt/global/core/app/constants';
@@ -158,6 +164,64 @@ describe('内部团队全员图谱与工作流协作', () => {
         per: WritePermissionVal
       })
     ).rejects.toBeDefined();
+  });
+
+  it('新建和存量技能共享，收回开发角色后仍可读但不能再借旧共享ACL写入', async () => {
+    await MongoResourcePermission.create({
+      teamId: root.teamId,
+      tmbId: member.tmbId,
+      resourceType: PerResourceTypeEnum.team,
+      permission: TeamSkillCreateRoleVal
+    });
+    const createSkill = () =>
+      MongoAgentSkills.create({
+        teamId: root.teamId,
+        tmbId: root.tmbId,
+        source: 'personal',
+        type: 'skill',
+        name: '共享技能',
+        description: '测试'
+      });
+    const current = await createSkill();
+    await mongoSessionRun((session) =>
+      createResourcePermissions({
+        resource: current,
+        resourceType: PerResourceTypeEnum.agentSkill,
+        tmbId: root.tmbId,
+        session
+      })
+    );
+    const old = await createSkill();
+    await synchronizeYunshuCollaboration({ repository: createYunshuRepository(), actor: root });
+    for (const skill of [current, old]) {
+      expect(
+        (
+          await authSkillByTmbId({
+            tmbId: member.tmbId,
+            skillId: String(skill._id),
+            per: WritePermissionVal
+          })
+        ).skill.permission.hasWritePer
+      ).toBe(true);
+    }
+    await MongoResourcePermission.updateOne(
+      { teamId: root.teamId, tmbId: member.tmbId, resourceType: PerResourceTypeEnum.team },
+      { permission: TeamReadRoleVal }
+    );
+    await expect(
+      authSkillByTmbId({
+        tmbId: member.tmbId,
+        skillId: String(current._id),
+        per: WritePermissionVal
+      })
+    ).rejects.toBeDefined();
+    const read = await authSkillByTmbId({
+      tmbId: member.tmbId,
+      skillId: String(current._id),
+      per: 0b100
+    });
+    expect(read.skill.permission.hasReadPer).toBe(true);
+    expect(read.skill.permission.hasWritePer).toBe(false);
   });
 
   it('关闭开关维持原权限，系统 Agent 私有应用不共享', async () => {

@@ -24,9 +24,11 @@ import { AppListSortEnum, appListSortMongoMap } from '@fastgpt/global/core/app/c
 import { normalizePagination } from '../../../../common/api/pagination';
 import { countTeamAppsByPublishedResourceGroups } from '../../../app/resourceLookup';
 import { getSkillFolderListScope } from './folder';
+import { yunshuSkillViewPermission } from '../../../../support/yunshu/skillPolicy';
 
 type TeamPermission = {
   isOwner: boolean;
+  hasSkillCreatePer?: boolean;
 };
 
 type ListReadableAgentSkillsParams = ListSkillsV2Query & {
@@ -309,7 +311,7 @@ export const listReadableAgentSkills = async (params: ListReadableAgentSkillsPar
         };
 
         return {
-          Per: getPer(),
+          Per: yunshuSkillViewPermission(teamId, tmbId, teamPer, getPer()),
           privateSkill: resourceClbs.length <= 1
         };
       })();
