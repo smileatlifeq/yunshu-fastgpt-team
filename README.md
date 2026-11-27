@@ -1,5 +1,7 @@
 > 本仓库专供团队部署，使用唯一的 `main` 分支。部署、账号、共享工作流、技能/MCP 权限及可选沙盒说明见 [TEAM_README.md](TEAM_README.md)。以下保留官方项目介绍与版权信息。
 
+> 团队部署前请先读 [首次启用步骤](TEAM_README.md#首次启用团队协作) 和 [部署及协作注意事项](TEAM_README.md#部署和协作注意事项)，按本仓库源码构建定制主站。
+
 <div align="center">
 
 <a href="https://fastgpt.io/?source=github&utm_source=github&utm_medium=referral&utm_campaign=github_home&utm_content=logo"><img src="/.github/imgs/logo.svg" width="120" height="120" alt="fastgpt logo"></a>
