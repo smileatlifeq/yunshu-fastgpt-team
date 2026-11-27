@@ -1,6 +1,6 @@
 # 云枢图谱内部账号与 GraphRAG 管理接通
 
-> **当前版本说明（2026-11-26）**：本文件同时记录“独立账号管理”和“全员协作授权”两轮改造。开启 `YUNSHU_TEAM_COLLABORATION_ENABLED` 后，指定内部团队全体活跃成员（包括基础角色为 query_user 的账号）都可以管理图谱和编辑共享工作流；关闭时仍按原基础角色判断。下文早期“查询用户不能管理”的验收只对应关闭开关的行为。升级移植以末尾“社区版升级与合并记录”为准。
+> **当前版本说明（2026-11-27）**：团队协作已改为默认开启，仍只作用于明确绑定的团队，显式 `YUNSHU_TEAM_COLLABORATION_ENABLED=false` 可关闭。指定团队全体活跃成员（包括 query_user）可管理图谱和编辑共享工作流；技能/MCP 的逐人开关保持独立。下文默认关闭的旧实施记录属于历史，以第 12 节为准。早期“查询用户不能管理”的验收只对应关闭开关的行为。
 
 基础：官方 FastGPT v4.17.5；GraphRAG 使用 smileatlifeq/graph-rag-agent-new 的 FastgptPlugins，起点 a60886b990d497ba1ccadcdbc946c5b972f62f10。
 
@@ -94,7 +94,7 @@ HTTP 联调启动器 `projects/app/scripts/yunshu-auth-smoke.ts` 只用于隔离
 | `projects/app/src/pages/api/support/user/account/loginByPassword.ts` | 查真实 user ID，使用 `withUserLock` 覆盖凭据验证到 `finishPasswordLogin` 完成会话创建的全过程 | 若官方拆分登录、增加多因素验证或迁移会话服务，把相同并发边界接到新的登录收尾处；保留官方新增验证分支 |
 | `packages/service/support/user/team/controller.ts` | `getTeamMember` 先读原团队 ACL，再仅为绑定团队活跃真人成员补管理/创建应用角色 | 若角色位、状态枚举、成员读取入口或 Agent 身份初始化变化，改用新服务的等效接口；基础 ACL 原值仍是关闭开关后的依据 |
 | `packages/service/support/permission/resourcePermissionService.ts` | `createResourcePermissions` 保留父级继承和创建者 owner，追加绑定团队默认全员组的共享权限 | 若官方重构 ACL 初始化、个人权限优先级或资源继承快照，重新定位“新资源创建时”的统一入口；同时保证已有个人读取记录不阻断全员编辑 |
-| `packages/service/env.ts` | 注册默认 false 的 `YUNSHU_TEAM_COLLABORATION_ENABLED` | 沿用新版本环境变量校验方式，默认关闭，团队 ID 仍来自受控服务配置 |
+| `packages/service/env.ts` | 注册默认 true 的 `YUNSHU_TEAM_COLLABORATION_ENABLED` | 沿用环境变量校验方式，支持显式 false；团队 ID 仍来自受控服务配置 |
 
 `packages/service/support/user/session.ts`、用户/团队/权限 Schema 是依赖，**本改造没有直接修改它们**。升级时需要核对这些依赖的签名和行为，但不要把整份旧文件复制到新版。
 
@@ -125,10 +125,10 @@ FastGPT 使用：
 ```dotenv
 YUNSHU_ADMIN_TEAM_ID=<从 root 的 /yunshu 页面读取的固定团队 ID>
 YUNSHU_ADMIN_ORIGINS=https://your-team.example.com
-YUNSHU_TEAM_COLLABORATION_ENABLED=false
+YUNSHU_TEAM_COLLABORATION_ENABLED=true
 ```
 
-- 开关默认关闭；明确需要全员协作的实例改为 true 后重启，并由 root 在 `/yunshu` 同步现有应用。新资源随后自动补权，新成员通过默认全员组获得权限。
+- 开关默认开启；管理员仍须绑定团队并配置实际访问地址，重启后由 root 在 `/yunshu` 同步已有资源。新资源随后自动补权，新成员通过默认全员组获得权限；显式 false 可关闭，旧配置中的 false 不会被覆盖。
 - 两种基础角色仍保存在账号绑定和原团队 ACL 中。开启协作时，query_user 也获得本团队的图谱管理和共享应用编辑能力；页面不再将它显示为只读限制。
 - 应用“写入”包含工作流保存和版本发布，不等于应用 owner，也不开放系统账号管理。当前没有多人实时合并同一草稿的能力。
 - 复用既有 Mongo 用户/团队/成员/ACL，用户元数据使用 `meta.yunshu.schemaVersion=1`，通过 `revision` 做并发修改检查；未增加用户表、Mongo 索引或数据库迁移。
@@ -216,3 +216,11 @@ pnpm --filter @fastgpt/app build
 本次逐项对照当前源码：自动共享只作用于绑定团队、全体活跃成员含 query_user；应用/技能写权限与知识库读权限分开；系统专用账号不是普通业务 Agent 应用；普通 MCP 共同维护不授予身份代理或 API 密钥管理权限，维护者仍会接触对应服务入口和令牌。关闭总开关不撤销既有资源 ACL；同一草稿没有同时编辑自动合并；技能代码环境为官方沙盒接入，由部署管理员集中配置。
 
 文档明确区分本机已完成的真实登录、HTTP、浏览器终端验收与尚未部署验收的团队服务器；不将沙盒算作新写的执行引擎，不声称商业功能解锁，不把另一仓库待审核的 GraphRAG 多人任务/日志/恢复配套算作本 FastGPT 已上线功能。此次仅做文档、链接、差异及远端内容核对，不重新运行构建、业务测试或模型调用；未更改业务代码、部署 YAML、运行时服务及同事 GraphRAG 分支。
+
+### 12. 2026-11-27 团队协作默认开启
+
+按用户最新要求，`YUNSHU_TEAM_COLLABORATION_ENABLED` 在服务环境 Schema 和配置示例中默认 true。缺省及空值使用默认开启，显式 false 保持关闭；旧实例配置中已有的 false 不被默认值覆盖。未绑定 `YUNSHU_ADMIN_TEAM_ID` 仍不共享，存量应用/技能仍由 root 执行同步，技能和普通 MCP 的逐人开关、系统专用账号与其他团队边界保持原规则。
+
+配套 GraphRAG 功能分支同步将团队协作默认开启，未绑定团队时保留 root 原用法及创建者边界；独立公开 FastGPT 仓库仍为团队部署来源，GraphRAG 不引入 FastGPT 整份源码或技能沙盒。GraphRAG PR 继续等待同事审核，不合并同事分支。本次针对环境默认值与显式关闭执行局部回归，不将旧浏览器/真实登录验收记录冒充为新版本验收。
+
+本轮实际验证：FastGPT 环境、账号、共享和 MCP 四份局部测试共 61 项通过、退出码 0，测试收尾出现一次 ECONNRESET 输出，未导致测试失败；GraphRAG 身份和协作共 22 项通过、退出码 0，修改的三份 Python 文件语法检查通过。未重新构建主站或重启服务，未调用模型、修改业务数据库或部署服务器；提交前核对差异和文档链接。

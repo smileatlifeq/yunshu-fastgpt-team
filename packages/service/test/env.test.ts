@@ -27,6 +27,7 @@ const originalEnv = {
   STORAGE_DOWNLOAD_URL_MODE: process.env.STORAGE_DOWNLOAD_URL_MODE,
   SYNC_INDEX: process.env.SYNC_INDEX,
   DEFAULT_TEAM_BASIC_PERMISSIONS_ENABLED: process.env.DEFAULT_TEAM_BASIC_PERMISSIONS_ENABLED,
+  YUNSHU_TEAM_COLLABORATION_ENABLED: process.env.YUNSHU_TEAM_COLLABORATION_ENABLED,
   AES256_SECRET_KEY: process.env.AES256_SECRET_KEY,
   INVOKE_TOKEN_SECRET: process.env.INVOKE_TOKEN_SECRET,
   SOMARK_API_KEY: process.env.SOMARK_API_KEY,
@@ -102,6 +103,7 @@ describe('serviceEnv', () => {
       'DEFAULT_TEAM_BASIC_PERMISSIONS_ENABLED',
       originalEnv.DEFAULT_TEAM_BASIC_PERMISSIONS_ENABLED
     );
+    vi.stubEnv('YUNSHU_TEAM_COLLABORATION_ENABLED', originalEnv.YUNSHU_TEAM_COLLABORATION_ENABLED);
     vi.stubEnv('AES256_SECRET_KEY', originalEnv.AES256_SECRET_KEY);
     vi.stubEnv('INVOKE_TOKEN_SECRET', originalEnv.INVOKE_TOKEN_SECRET);
     vi.stubEnv('SOMARK_API_KEY', originalEnv.SOMARK_API_KEY);
@@ -278,6 +280,24 @@ describe('serviceEnv', () => {
     await expect(importServiceEnv()).resolves.toMatchObject({
       serviceEnv: { DEFAULT_TEAM_BASIC_PERMISSIONS_ENABLED: true }
     });
+  });
+
+  it('defaults bound-team collaboration to enabled while honoring explicit false', async () => {
+    vi.stubEnv('FILE_TOKEN_KEY', 'filetokenkey');
+    vi.stubEnv('AES256_SECRET_KEY', 'fastgptsecret');
+    vi.stubEnv('INVOKE_TOKEN_SECRET', validInvokeTokenSecret);
+
+    for (const [value, enabled] of [
+      [undefined, true],
+      ['', true],
+      ['true', true],
+      ['false', false]
+    ] as const) {
+      vi.stubEnv('YUNSHU_TEAM_COLLABORATION_ENABLED', value);
+      await expect(importServiceEnv()).resolves.toMatchObject({
+        serviceEnv: { YUNSHU_TEAM_COLLABORATION_ENABLED: enabled }
+      });
+    }
   });
 
   it('reads the optional SoMark API key', async () => {
